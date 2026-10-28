@@ -26,9 +26,7 @@
   ],
   "whiteListMode": {
     "enable": false,
-    "whiteListIds": [
-      61571138559424
-    ],
+    "whiteListIds": [61571138559424],
     "notes": "if you enable this feature, only the ids in the whiteListIds section can use the bot"
   },
   "nickNameBot": "🔮Grand Sage🔮",
@@ -36,23 +34,23 @@
   "api": "https://mahabub-apis.fun",
   "database": {
     "type": "mongodb",
-    "uriMongodb": "",
+    "uriMongodb": "mongodb+srv://mahabub:0000@cluster0.wg033zv.mongodb.net/?appName=Cluster0",
     "autoSyncWhenStart": true,
     "autoRefreshThreadInfoFirstTime": true,
     "notes": "(1) type selects 'json' or 'sqlite' or 'mongodb'. If you choose mongodb, enter uri connect mongodb in the uriMongodb section, instructions to get uri connect mongodb at: https://youtu.be/z1f9urHW5xY. I recommend using 'mongodb' or 'sqlite', json is not recommended because it is not stable. (2) when you set autoSyncWhenStart to true, the bot will automatically synchronize the data in the database when starting the bot, this will make the bot start slower. (3) when you set autoRefreshThreadInfoFirstTime to true, the bot will automatically refresh the thread information when get first message from the thread since starting the bot"
   },
   "timeZone": "Asia/Dhaka",
   "credentials": {
-    "gmailAccount": {
-      "email": "",
-      "clientId": "",
-      "clientSecret": "",
-      "refreshToken": "",
+  "gmailAccount": {
+      "email": "mpk852546@gmail.com",
+      "clientId": "468637297192-06rlphmj6lohjaj87l9f2faugjpvjo2m.apps.googleusercontent.com",
+      "clientSecret": "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",
+      "refreshToken": "1//04HwrGyc1o84yCgYIARAAGAQSNwF-L9IrUgry1nG4YkdzjTCMo2dHLKsXrCnebeUNyfo5W-LeiqRo76BM6K48I1EKjIvwpTwO3xI",
       "apiKey": ""
     },
     "gRecaptcha": {
-      "siteKey": "",
-      "secretKey": ""
+      "siteKey": "6Lff7Y0mAAAAALiv3IBkCCOfCdEsN-lK-jtR5FCm",
+      "secretKey": "6Lff7Y0mAAAAAGQr8dO3lqDJVhTi8Q-tpLLy2kGo"
     }
   },
   "dashBoard": {
@@ -147,4 +145,3 @@
     "notes": "Document here: https://github.com/ntkhang03/fb-chat-api/blob/master/DOCS.md#apisetoptionsoptions "
   }
 }
-  
