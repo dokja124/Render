@@ -1,31 +1,42 @@
+const quiz = require("./lib/anime-quiz");
+const { send } = require("./lib/messenger");
+
 module.exports = {
   config: {
     name: "animequiz",
-    version: "1.0.0-messenger",
+    version: "2.0.0",
     author: "Diwate",
-    description: "Quiz de culture anime",
+    description: "Lance un quiz de culture anime",
     category: "Anime",
     usages: "animequiz",
     role: 0
   },
-  langs: {
-    fr: {
-      error: "Une erreur est survenue pendant l’exécution de la commande."
-    }
-  },
-  onStart: async function ({ api, message, event, args, prefix }) {
+
+  onStart: async function ({ api, message, event, prefix }) {
     try {
-      const questions = [
-      {q:"Quel est le rêve de Naruto ?", a:["Devenir Hokage", "Devenir pirate", "Devenir alchimiste"], c:0},
-      {q:"Dans quel anime trouve-t-on Monkey D. Luffy ?", a:["Bleach", "One Piece", "Fairy Tail"], c:1},
-      {q:"Quel est le prénom de l'Elric qui est alchimiste d'État ?", a:["Edward", "Alphonse", "Roy"], c:0},
-      {q:"Quel sport est au centre de Blue Lock ?", a:["Basket", "Football", "Volley"], c:1}
-    ];
-    const q = questions[Math.floor(Math.random()*questions.length)];
-    return message.reply(`🎌 QUIZ ANIME\n\n${q.q}\n\n${q.a.map((x,i)=>`${i+1}. ${x}`).join("\n")}\n\nRéponds avec ${prefix}reponse <numéro>.\nRéponse : ${q.c+1} (affichée ici pour cette version simple).`);
+      const threadID = event && event.threadID;
+      const userID = event && event.senderID;
+      if (!userID) return send({ api, message, event }, "❌ Impossible d’identifier le participant.");
+
+      const question = quiz.QUESTIONS[Math.floor(Math.random() * quiz.QUESTIONS.length)];
+      quiz.pending.set(quiz.sessionKey(threadID, userID), {
+        question,
+        createdAt: Date.now()
+      });
+      const body = [
+        "🎌 QUIZ ANIME",
+        "",
+        question.question,
+        "",
+        ...question.answers.map((answer, index) => `${index + 1}. ${answer}`),
+        "",
+        `Réponds avec ${prefix || "!"}reponse <numéro> (1 à ${question.answers.length}).`,
+        "⏱️ La question expire après 5 minutes."
+      ].join("\n");
+      return send({ api, message, event }, body);
     } catch (error) {
       console.error("[Commande animequiz]", error);
-      return message.reply("❌ Une erreur est survenue. Réessaie plus tard.");
+      return send({ api, message, event }, "❌ Le quiz n’a pas pu être démarré. Réessaie plus tard.");
     }
   }
 };

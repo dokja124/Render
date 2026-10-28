@@ -1,27 +1,20 @@
+const { send } = require("./lib/messenger");
+
 module.exports = {
   config: {
-    name: "ping",
-    version: "1.0.0-messenger",
-    author: "Diwate",
-    description: "Vérifie la latence",
-    category: "Général",
-    usages: "ping",
-    role: 0
+    name: "ping", version: "2.0.0", author: "Diwate",
+    description: "Mesure le temps de réponse Messenger",
+    category: "Général", usages: "ping", role: 0
   },
-  langs: {
-    fr: {
-      error: "Une erreur est survenue pendant l’exécution de la commande."
-    }
-  },
-  onStart: async function ({ api, message, event, args, prefix }) {
+  onStart: async function ({ api, message, event }) {
+    const started = Date.now();
     try {
-      const start = Date.now();
-    await message.reply("🏓 Calcul de la latence…");
-    const latency = Date.now() - start;
-    return message.reply(`🏓 Pong !\n⚡ Temps de réponse : environ ${latency} ms`);
+      await send({ api, message, event }, "🏓 Mesure du temps de réponse…");
+      const elapsed = Date.now() - started;
+      return send({ api, message, event }, `🏓 Pong !\n⚡ Temps de réponse du premier envoi : ${elapsed} ms`);
     } catch (error) {
       console.error("[Commande ping]", error);
-      return message.reply("❌ Une erreur est survenue. Réessaie plus tard.");
+      return send({ api, message, event }, "❌ Messenger n’a pas confirmé l’envoi. Vérifie la connexion du bot.");
     }
   }
 };
