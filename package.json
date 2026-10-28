@@ -56,9 +56,9 @@
 		"websocket-stream": "^5.5.2"
 	},
 	"scripts": {
-		"start": "node index.js",
-		"dev": "node -e \"process.env.NODE_ENV='development'; require('./index.js')\"",
-		"prod": "node -e \"process.env.NODE_ENV='production'; require('./index.js')\""
+		"start": "set NODE_ENV=&& node index.js",
+		"dev": "set NODE_ENV=development&& node index.js",
+		"prod": "set NODE_ENV=production&& node index.js"
 	},
 	"author": "NTKhang",
 	"license": "MIT",
@@ -90,5 +90,4 @@
 		"prompt-checkbox": "^2.2.0",
 		"terser": "^5.15.0"
 	}
-}
-	
+	}
