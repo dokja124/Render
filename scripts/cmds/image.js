@@ -62,6 +62,7 @@ async function searchWikimedia(query) {
   const info = page.imageinfo[0];
   return {
     url: info.thumburl || info.url,
+    urls: [...new Set([info.thumburl, info.url].filter(value => typeof value === "string" && /^https:\/\//i.test(value)))],
     title: String(page.title || query).replace(/^File:/i, "").replace(/_/g, " "),
     pageUrl: `https://commons.wikimedia.org/wiki/${encodeURIComponent(String(page.title || "").replace(/ /g, "_"))}`,
     source: "Wikimedia Commons"
@@ -69,18 +70,34 @@ async function searchWikimedia(query) {
 }
 
 async function fetchJpeg(imageUrl) {
-  const response = await axios.get(imageUrl, {
-    responseType: "arraybuffer",
-    timeout: 20000,
-    maxContentLength: MAX_IMAGE_BYTES,
-    maxBodyLength: MAX_IMAGE_BYTES,
-    maxRedirects: 5,
-    headers: { Accept: "image/jpeg,image/png,image/webp,image/*;q=0.8" }
-  });
-  const input = Buffer.from(response.data);
-  if (!input.length || input.length > MAX_IMAGE_BYTES) throw new Error("Image vide ou trop volumineuse.");
-  const image = await Jimp.read(input);
-  return image.quality(88).getBufferAsync(Jimp.MIME_JPEG);
+  const urls = [...new Set((Array.isArray(imageUrl) ? imageUrl : [imageUrl]).filter(url => typeof url === "string" && /^https:\/\//i.test(url)))];
+  if (!urls.length) throw new Error("Aucune URL d’image HTTPS valide.");
+  let lastError;
+  for (const url of urls) {
+    try {
+      const host = new URL(url).hostname.toLowerCase();
+      const referer = host.endsWith("pinimg.com") ? "https://www.pinterest.com/" : "https://commons.wikimedia.org/";
+      const response = await axios.get(url, {
+        responseType: "arraybuffer",
+        timeout: 20000,
+        maxContentLength: MAX_IMAGE_BYTES,
+        maxBodyLength: MAX_IMAGE_BYTES,
+        maxRedirects: 5,
+        headers: {
+          Accept: "image/jpeg,image/png,image/webp,image/*;q=0.8",
+          "User-Agent": "Mozilla/5.0 (compatible; GoatBot/1.0; +https://github.com/ntkhang03/Goat-Bot-V2)",
+          Referer: referer
+        }
+      });
+      const input = Buffer.from(response.data);
+      if (!input.length || input.length > MAX_IMAGE_BYTES) throw new Error("Image vide ou trop volumineuse.");
+      const image = await Jimp.read(input);
+      return await image.quality(88).getBufferAsync(Jimp.MIME_JPEG);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError || new Error("Impossible de récupérer ou convertir l’image.");
 }
 
 module.exports = {
@@ -118,7 +135,7 @@ module.exports = {
           result = await searchPinterest(query);
           if (result) {
             stage = "conversion JPEG";
-            jpeg = await fetchJpeg(result.url);
+            jpeg = await fetchJpeg(result.urls || result.url);
           } else {
             pinterestError = new Error("Aucune image Pinterest exploitable.");
           }
@@ -141,7 +158,7 @@ module.exports = {
         }
         if (result) {
           stage = "conversion JPEG";
-          jpeg = await fetchJpeg(result.url);
+          jpeg = await fetchJpeg(result.urls || result.url);
         }
       }
       if (!result) return send({ api, message, event }, `🔎 Aucune image trouvée pour « ${query} ». Essaie un autre mot-clé.`);
@@ -176,4 +193,4 @@ module.exports = {
     }
   }
 };
-  
+    
