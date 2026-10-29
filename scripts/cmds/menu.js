@@ -1,4 +1,4 @@
-const VIDEO_URL = "https://files.catbox.moe/istabd.mp4";
+const axios = require("axios");
 const CATEGORY_EMOJI = {
   Administration: "🛡️",
   Anime: "🎌",
@@ -6,17 +6,18 @@ const CATEGORY_EMOJI = {
   Général: "✨",
   Médias: "🖼️",
   Outils: "🧰",
-  Menu: "📚"
+  Menu: "📚",
+  Utilitaires: "🧰",
+  Sondages: "📊"
 };
+const VIDEO_URL = "https://files.catbox.moe/istabd.mp4";
 
 function buildMenu(commands, prefix) {
   const entries = commands instanceof Map ? Array.from(commands.entries()) : [];
   const grouped = new Map();
-
   for (const [key, command] of entries) {
     const config = command && command.config;
     if (!config || !config.name) continue;
-
     const category = config.category || "Autres";
     if (!grouped.has(category)) grouped.set(category, []);
     grouped.get(category).push({
@@ -25,79 +26,63 @@ function buildMenu(commands, prefix) {
     });
   }
 
-  const categories = Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b, "fr"));
-  const lines = [
-    "╭━━━〔 🤖 MENU DU BOT 〕━━━╮",
-    `│ Préfixe : ${prefix}`,
-    "│ Voici les commandes disponibles :",
-    "├────────────────────"
-  ];
-
-  for (const category of categories) {
-    const emoji = CATEGORY_EMOJI[category] || "📂";
-    lines.push(`│ ${emoji} ${category}`);
-    const items = grouped.get(category).sort((a, b) => a.name.localeCompare(b.name, "fr"));
-    for (const item of items) {
-      lines.push(`│   • ${prefix}${item.name} — ${item.description}`);
+  const lines = ["╭━━━〔 🤖 MENU DU BOT 〕━━━╮", `│ Préfixe : ${prefix}`, "│ Commandes disponibles :", "├────────────────────"];
+  for (const category of Array.from(grouped.keys()).sort((a, b) => a.localeCompare(b, "fr"))) {
+    lines.push(`│ ${CATEGORY_EMOJI[category] || "📂"} ${category}`);
+    for (const command of grouped.get(category).sort((a, b) => a.name.localeCompare(b.name, "fr"))) {
+      lines.push(`│   • ${prefix}${command.name} — ${command.description}`);
     }
   }
-
   lines.push("├────────────────────", `│ 💡 Exemple : ${prefix}ping`, "╰━━━━━━━━━━━━━━━━━━━━╯");
   let body = lines.join("\n");
-  if (body.length > 16000) {
-    body = `${body.slice(0, 15900)}\n…\nLa liste a été raccourcie pour tenir dans un message Messenger.`;
-  }
+  if (body.length > 16000) body = `${body.slice(0, 15900)}\n…\nListe raccourcie pour tenir dans un message Messenger.`;
   return body;
-}
-
-async function sendMessage({ api, message, event }, payload) {
-  if (message && typeof message.send === "function") {
-    return message.send(payload);
-  }
-  if (api && typeof api.sendMessage === "function" && event && event.threadID) {
-    return api.sendMessage(payload, event.threadID);
-  }
-  throw new Error("Aucune méthode d’envoi Messenger disponible.");
 }
 
 module.exports = {
   config: {
     name: "menu",
-    version: "1.0.0",
+    version: "3.0.0",
     author: "Diwate",
-    description: "Affiche la liste des commandes avec une vidéo",
+    description: "Envoie la liste des commandes puis une vidéo jointe",
     category: "Menu",
     usages: "menu",
     role: 0
   },
 
   buildMenu,
+  VIDEO_URL,
 
-  onStart: async function ({ api, message, event, prefix }) {
-    const commands = global.GoatBot && global.GoatBot.commands;
-    const body = buildMenu(commands, prefix || "!");
+  onStart: async function ({ api, event, prefix }) {
+    const body = buildMenu(global.GoatBot && global.GoatBot.commands, prefix || "!");
+    if (!event || !event.threadID || !api || typeof api.sendMessage !== "function") {
+      throw new Error("API Messenger ou identifiant de conversation indisponible.");
+    }
+
+    // Envoi 1 : le menu sous forme de message texte indépendant.
+    await api.sendMessage(body, event.threadID);
+
+    // Envoi 2 : le fichier MP4 distant est transmis comme pièce jointe, pas comme URL texte.
     let videoStream;
-
     try {
-      const axios = require("axios");
       const response = await axios.get(VIDEO_URL, {
         responseType: "stream",
-        timeout: 25000,
-        maxRedirects: 5
+        timeout: 30000,
+        maxRedirects: 5,
+        headers: { Accept: "video/mp4" }
       });
+      if (response.status < 200 || response.status >= 300) {
+        throw new Error(`Téléchargement vidéo HTTP ${response.status}`);
+      }
       videoStream = response.data;
-      // The multipart uploader uses the stream path to infer a filename/MIME type.
-      videoStream.path = "bot-menu.mp4";
-      await sendMessage({ api, message, event }, { body, attachment: videoStream });
+      videoStream.path = "menu-video.mp4";
+      return await api.sendMessage({ attachment: videoStream }, event.threadID);
     } catch (error) {
       if (videoStream && typeof videoStream.destroy === "function" && !videoStream.destroyed) {
         videoStream.destroy();
       }
-      console.error("[Commande menu] Impossible de joindre la vidéo :", error.message);
-      await sendMessage(
-        { api, message, event },
-        { body: `${body}\n\n🎥 Vidéo : ${VIDEO_URL}` }
-      );
+      console.error("[Commande menu] Échec de l’envoi de la vidéo jointe :", error.message);
+      return api.sendMessage("⚠️ Le menu est envoyé, mais Messenger n’a pas accepté la vidéo. Consulte les logs du bot.", event.threadID);
     }
   }
 };

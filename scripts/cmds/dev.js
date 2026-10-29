@@ -1,20 +1,36 @@
-const packageInfo = require("../../package.json");
 const { send } = require("./lib/messenger");
+
+const PROFILE = {
+  name: "Mr Diwate",
+  role: "Développeur et mainteneur du bot Messenger",
+  facebook: "https://facebook.com/61571138559424"
+};
 
 module.exports = {
   config: {
-    name: "dev", version: "2.0.0", author: "Diwate",
-    description: "Affiche les informations techniques du bot",
-    category: "Général", usages: "dev", role: 0
+    name: "dev",
+    version: "4.0.0",
+    author: PROFILE.name,
+    description: "Affiche le profil Facebook du développeur du bot",
+    category: "Général",
+    usages: "dev",
+    role: 0
   },
+
+  PROFILE,
+
   onStart: async function ({ api, message, event }) {
-    const commandCount = global.GoatBot && global.GoatBot.commands instanceof Map
-      ? global.GoatBot.commands.size
-      : "indisponible";
-    const uptimeSeconds = Math.floor(process.uptime());
-    return send(
-      { api, message, event },
-      `👨‍💻 INFORMATIONS DU BOT\n📦 Projet : ${packageInfo.name || "Bot Messenger"}\n🏷️ Version : ${packageInfo.version || "inconnue"}\n🟢 Node.js : ${process.version}\n🧩 Commandes chargées : ${commandCount}\n⏱️ Uptime : ${uptimeSeconds} s`
-    );
+    const card = [
+      "╭━━━〔 🌸✨ PROFIL DU DÉVELOPPEUR ✨🌸 〕━━━╮",
+      "",
+      `💫 Mon développeur est ${PROFILE.name} 💞`,
+      `👨‍💻 ${PROFILE.role}`,
+      "",
+      "🔗 Son profil Facebook :",
+      PROFILE.facebook,
+      "",
+      "╰━━━━━━〔 Merci d’utiliser le bot ! 〕━━━━━━╯"
+    ].join("\n");
+    return send({ api, message, event }, card);
   }
 };
