@@ -187,9 +187,13 @@ module.exports = {
   getMessageIdentity,
   countMessage,
   onEvent: countMessage,
+  onAnyEvent: countMessage,
 
   onStart: async function ({ api, message, event, usersData }) {
     try {
+      // Repli fiable : compte aussi le message !rang lui-même si le hook d’événement est retardé.
+      // incrementMessage déduplique le même message reçu via onEvent/onAnyEvent.
+      await countMessage({ event, usersData });
       const mention = getMentionTarget(event);
       const targetID = mention && mention.id || String(event && (event.senderID || event.userID || event.author) || "");
       if (!targetID) return send({ api, message, event }, "❌ Impossible d’identifier ce membre.");
@@ -255,3 +259,4 @@ module.exports = {
     }
   }
 };
+    
