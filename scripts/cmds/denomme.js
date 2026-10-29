@@ -30,7 +30,7 @@ module.exports = {
     author: "Diwate",
     description: "Retire le rôle administrateur au membre dont tu cites le message",
     category: "Groupe",
-    usages: "Réponds au message d’un administrateur avec !denomme",
+    usages: "Réponds au message de l’administrateur (ou au tien) avec !denomme",
     role: 0
   },
   normalizeIDs,
@@ -83,4 +83,4 @@ module.exports = {
     }
   }
 };
-                    
+    
