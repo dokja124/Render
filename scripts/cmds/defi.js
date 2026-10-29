@@ -236,6 +236,7 @@ function challengeMessage(event, mention, prefix) {
 module.exports = {
   config: {
     name: "defi",
+    aliases: ["défi"],
     version: "5.0.0",
     author: "Diwate",
     description: "Combat ninja au tour par tour avec règles et statistiques contrôlées",
@@ -405,4 +406,18 @@ module.exports = {
         game.status = "finished";
         game.winner = fighter.id;
         await saveGames(globalData, games);
-        return send({ api, message, event }, `💥 ${actionT
+        return send({ api, message, event }, `💥 ${actionText}\n\n${statusMessage(game)}\n\n🏆 ${fighter.name} remporte le combat !`);
+      }
+
+      game.turn = 1 - currentIndex;
+      if (currentIndex === 1) game.round = clampInt(game.round + 1, 1, Number.MAX_SAFE_INTEGER, 1);
+      await saveGames(globalData, games);
+      return send({ api, message, event }, `${actionText}\n\n${statusMessage(game)}\n\n🎮 À toi, ${opponent.name} !`);
+    } catch (error) {
+      console.error("[Commande défi]", error.stack || error);
+      return send({ api, message, event }, "❌ Le combat a rencontré un problème. Les PV/chakra n’ont pas été modifiés par une action invalide; réessaie ou relance un défi.");
+    } finally {
+      release();
+    }
+  }
+};
