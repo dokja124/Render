@@ -1,7 +1,20 @@
 const { send } = require("./lib/messenger");
-const arena = require("./lib/arena");
 
+const STORAGE_KEY = "messengerArenaGames";
 const PENDING_TIMEOUT = 15 * 60 * 1000;
+let memoryGames = {};
+
+const FIGHTERS = [
+  { name: "Naruto", jutsu: "Rasengan", ultimate: "Rasenshuriken", power: 4 },
+  { name: "Sasuke", jutsu: "Chidori", ultimate: "Flèche d’Indra", power: 5 },
+  { name: "Sakura", jutsu: "Frappe chakra", ultimate: "Force des cent sceaux", power: 4 },
+  { name: "Kakashi", jutsu: "Raikiri", ultimate: "Kamui", power: 5 },
+  { name: "Gaara", jutsu: "Tombeau du désert", ultimate: "Grande cascade de sable", power: 3 },
+  { name: "Rock Lee", jutsu: "Lotus recto-verso", ultimate: "Portes intérieures", power: 5 },
+  { name: "Hinata", jutsu: "Paume des Hakke", ultimate: "Soixante-quatre paumes", power: 3 },
+  { name: "Shikamaru", jutsu: "Possession des ombres", ultimate: "Stratégie de l’ombre", power: 3 }
+];
+
 const HELP = [
   "🥷 ARENA NINJA — COMBAT AU TOUR PAR TOUR",
   "",
@@ -43,6 +56,62 @@ function randomInt(min, max) {
   return min + Math.floor(Math.random() * (max - min + 1));
 }
 
+function pickFighter() {
+  return FIGHTERS[Math.floor(Math.random() * FIGHTERS.length)];
+}
+
+function createPlayer(id, name) {
+  const fighter = pickFighter();
+  return {
+    id: String(id),
+    name: String(name || "Ninja").slice(0, 40),
+    fighter: fighter.name,
+    jutsu: fighter.jutsu,
+    ultimate: fighter.ultimate,
+    power: fighter.power,
+    hp: 100,
+    chakra: 30,
+    guarding: false,
+    dodging: false,
+    healUsed: false
+  };
+}
+
+async function getGames(globalData) {
+  if (!globalData || typeof globalData.get !== "function") return memoryGames;
+  const saved = await globalData.get(STORAGE_KEY, "data", {});
+  memoryGames = saved && typeof saved === "object" ? saved : {};
+  return memoryGames;
+}
+
+async function saveGames(globalData, games) {
+  memoryGames = games && typeof games === "object" ? games : {};
+  if (globalData && typeof globalData.get === "function" && typeof globalData.set === "function") {
+    await globalData.get(STORAGE_KEY, "data", memoryGames);
+    await globalData.set(STORAGE_KEY, memoryGames, "data");
+  }
+  return memoryGames;
+}
+
+function healthBar(hp) {
+  const filled = Math.max(0, Math.min(10, Math.ceil(hp / 10)));
+  return "🟩".repeat(filled) + "⬛".repeat(10 - filled) + ` ${hp}/100 PV`;
+}
+
+function battleStatus(game) {
+  if (!game || !Array.isArray(game.players)) return "Aucun combat actif.";
+  const [a, b] = game.players;
+  return [
+    `🥷 ${a.fighter} — ${a.name}`,
+    healthBar(a.hp) + ` | Chakra ${a.chakra}/100`,
+    "",
+    `🥷 ${b.fighter} — ${b.name}`,
+    healthBar(b.hp) + ` | Chakra ${b.chakra}/100`,
+    "",
+    game.status === "active" ? `⚡ Tour de ${game.players[game.turn].name}` : "🏁 Combat terminé"
+  ].join("\n");
+}
+
 function applyDamage(attacker, defender, baseDamage) {
   let damage = baseDamage;
   let result = "";
@@ -66,20 +135,28 @@ function applyDamage(attacker, defender, baseDamage) {
 }
 
 function statusMessage(game) {
-  return `🏟️ ARENA NINJA\n${arena.battleStatus(game)}`;
+  return `🏟️ ARENA NINJA\n${battleStatus(game)}`;
 }
 
 module.exports = {
   config: {
     name: "defi",
-    version: "3.0.0",
+    version: "4.0.0",
     author: "Diwate",
     description: "Défie un membre dans un combat ninja au tour par tour",
     category: "Divertissement",
     usages: "defi @mention | defi attaquer/jutsu/ultime/...",
     role: 0
   },
+  STORAGE_KEY,
+  FIGHTERS,
   normalize,
+  firstMention,
+  createPlayer,
+  getGames,
+  saveGames,
+  healthBar,
+  battleStatus,
   applyDamage,
 
   onStart: async function ({ api, message, event, args, prefix, globalData }) {
@@ -90,7 +167,7 @@ module.exports = {
       const words = Array.isArray(args) ? args : [];
       const action = normalize(words[0] || "");
       const mention = firstMention(event);
-      const games = await arena.getGames(globalData);
+      const games = await getGames(globalData);
       let game = games[threadID];
 
       if (["aide", "help"].includes(action) || action === "" && !mention) {
@@ -102,18 +179,18 @@ module.exports = {
         if (game.players[1].id !== userID) return send({ api, message, event }, "⛔ Seule la personne défiée peut accepter ce combat.");
         if (Date.now() - game.createdAt > PENDING_TIMEOUT) {
           delete games[threadID];
-          await arena.saveGames(globalData, games);
+          await saveGames(globalData, games);
           return send({ api, message, event }, "⌛ Ce défi a expiré. Lance-en un nouveau avec !defi @mention.");
         }
         game.players = [
-          arena.createPlayer(game.players[0].id, game.players[0].name),
-          arena.createPlayer(game.players[1].id, game.players[1].name)
+          createPlayer(game.players[0].id, game.players[0].name),
+          createPlayer(game.players[1].id, game.players[1].name)
         ];
-        if (game.players[0].fighter === game.players[1].fighter) game.players[1] = arena.createPlayer(game.players[1].id, game.players[1].name);
+        if (game.players[0].fighter === game.players[1].fighter) game.players[1] = createPlayer(game.players[1].id, game.players[1].name);
         game.status = "active";
         game.turn = 0;
         game.round = 1;
-        await arena.saveGames(globalData, games);
+        await saveGames(globalData, games);
         return send({ api, message, event }, `🔥 LE COMBAT COMMENCE !\n🥷 ${game.players[0].name} choisit ${game.players[0].fighter} (${game.players[0].jutsu}).\n🥷 ${game.players[1].name} choisit ${game.players[1].fighter} (${game.players[1].jutsu}).\n\n${statusMessage(game)}\n\n🎮 Premier tour : ${game.players[0].name}.`);
       }
 
@@ -122,7 +199,7 @@ module.exports = {
         if (action !== "annuler" && game.players[1].id !== userID) return send({ api, message, event }, "⛔ Seule la personne défiée peut refuser le défi.");
         if (action === "annuler" && game.players[0].id !== userID) return send({ api, message, event }, "⛔ Seule la personne qui a lancé le défi peut l’annuler.");
         delete games[threadID];
-        await arena.saveGames(globalData, games);
+        await saveGames(globalData, games);
         return send({ api, message, event }, "🚫 Le défi a été refusé/annulé.");
       }
 
@@ -138,7 +215,7 @@ module.exports = {
             { id: mention.id, name: String(targetName).slice(0, 40) }
           ]
         };
-        await arena.saveGames(globalData, games);
+        await saveGames(globalData, games);
         return send({ api, message, event }, `⚔️ ${event.senderName || "Un ninja"} défie ${targetName} !\n⏳ Le défi expire dans 15 minutes.\n✅ ${targetName}, écris ${prefix || "!"}defi accepter pour commencer, ou ${prefix || "!"}defi refuser.`);
       }
 
@@ -155,7 +232,7 @@ module.exports = {
       if (action === "abandonner") {
         game.status = "finished";
         game.winner = game.players[1 - currentIndex].id;
-        await arena.saveGames(globalData, games);
+        await saveGames(globalData, games);
         return send({ api, message, event }, `🏳️ ${game.players[currentIndex].name} abandonne.\n🏆 ${game.players[1 - currentIndex].name} remporte le combat !`);
       }
       if (currentIndex !== game.turn) return send({ api, message, event }, `⏳ Ce n’est pas ton tour. Attends ${game.players[game.turn].name}.`);
@@ -205,13 +282,13 @@ module.exports = {
       if (opponent.hp <= 0) {
         game.status = "finished";
         game.winner = fighter.id;
-        await arena.saveGames(globalData, games);
+        await saveGames(globalData, games);
         return send({ api, message, event }, `💥 ${actionText}\n\n${statusMessage(game)}\n\n🏆 ${fighter.name} remporte le combat !`);
       }
 
       game.turn = 1 - currentIndex;
       game.round = (game.round || 1) + 1;
-      await arena.saveGames(globalData, games);
+      await saveGames(globalData, games);
       return send({ api, message, event }, `${actionText}\n\n${statusMessage(game)}\n\n🎮 À toi, ${opponent.name} !`);
     } catch (error) {
       console.error("[Commande défi]", error.stack || error);
@@ -219,3 +296,4 @@ module.exports = {
     }
   }
 };
+    
