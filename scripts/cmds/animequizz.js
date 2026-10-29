@@ -264,4 +264,184 @@ async function startGame({ api, message, event, prefix, globalData }) {
   };
   sessions[threadID] = session;
   await saveSessions(globalData, sessions);
-  return send({ api, message, even
+  return send({ api, message, event }, `🎉 Nouvelle partie : 10 questions, quatre choix par question, et des questions renouvelées d’une partie à l’autre.\n\n${renderQuestion(session, prefix)}`);
+}
+
+function parseChoice(value) {
+  const text = String(value || "").trim().toUpperCase();
+  if (/^[1-4]$/.test(text)) return Number(text) - 1;
+  return ANSWER_LETTERS.indexOf(text);
+}
+
+function nextQuestion(session) {
+  session.currentIndex += 1;
+  if (session.currentIndex >= QUESTIONS_PER_GAME) return false;
+  const question = QUESTION_BY_ID.get(session.questionIds[session.currentIndex]);
+  if (!question) throw new Error(`Question absente de la banque : ${session.questionIds[session.currentIndex]}`);
+  session.current = prepareQuestion(question);
+  session.phase = "open";
+  return true;
+}
+
+async function submitAnswer({ api, message, event, args, prefix, globalData }, answerValue) {
+  const threadID = String(event.threadID);
+  const userID = String(event.senderID || "");
+  const sessions = await loadSessions(globalData);
+  const session = sessions[threadID];
+  if (!session) return send({ api, message, event }, `❓ Aucune partie en cours. Lance-en une avec ${prefix}animequizz.`);
+  if (session.status === "finished") return send({ api, message, event }, `🏁 Cette partie est terminée. Lance une nouvelle partie avec ${prefix}animequizz.`);
+  if (session.phase !== "open") return send({ api, message, event }, `🔒 Les réponses sont fermées pour cette question. Écris ${prefix}next pour continuer.`);
+  if (!userID) return send({ api, message, event }, "❌ Impossible d’identifier le participant.");
+  if (session.current.correctUsers.includes(userID)) return send({ api, message, event }, "✅ Ta bonne réponse a déjà été comptée pour cette question.");
+  if (session.current.correctUsers.length >= 2) return send({ api, message, event }, `🔒 Les deux places sont prises. Écris ${prefix}next pour continuer.`);
+
+  const choice = parseChoice(answerValue || args && args[0]);
+  if (choice < 0 || choice > 3) return send({ api, message, event }, `🔢 Choisis A, B, C ou D avec ${prefix}réponse A-D.`);
+  if (choice !== session.current.correctIndex) {
+    return send({ api, message, event }, "❌ Mauvaise réponse. Tu peux encore réessayer tant que les deux places ne sont pas prises.");
+  }
+
+  const place = session.current.correctUsers.length;
+  const points = place === 0 ? 3 : 2;
+  session.current.correctUsers.push(userID);
+  if (!session.scores[userID]) {
+    session.scores[userID] = { name: String(event.senderName || userID).slice(0, 50), points: 0, correctAnswers: 0 };
+    session.scoreOrder.push(userID);
+  }
+  session.scores[userID].name = String(event.senderName || session.scores[userID].name || userID).slice(0, 50);
+  session.scores[userID].points += points;
+  session.scores[userID].correctAnswers += 1;
+
+  if (session.current.correctUsers.length === 1) {
+    await saveSessions(globalData, sessions);
+    return send({ api, message, event }, `✅ Bonne réponse, ${session.scores[userID].name} ! Tu es le/la premier(ère) : +3 points. Il reste une place pour une deuxième bonne réponse.`);
+  }
+
+  const reveal = closeCurrentQuestion(session);
+  const announcement = `✅ Bonne réponse, ${session.scores[userID].name} ! Tu es deuxième : +2 points.\n\n${reveal}`;
+  let response = announcement;
+  if (session.currentIndex === QUESTIONS_PER_GAME - 1) response += `\n\n${finishGame(session)}`;
+  else response += `\n\nÉcris ${prefix}next pour afficher la prochaine question.`;
+  await saveSessions(globalData, sessions);
+  return send({ api, message, event }, response);
+}
+
+async function advanceGame({ api, message, event, prefix, globalData }) {
+  const threadID = String(event.threadID);
+  const sessions = await loadSessions(globalData);
+  const session = sessions[threadID];
+  if (!session) return send({ api, message, event }, `❓ Aucune partie en cours. Lance-en une avec ${prefix}animequizz.`);
+  if (session.status === "finished") return send({ api, message, event }, finishGame(session));
+
+  const parts = [];
+  if (session.phase === "open") parts.push(closeCurrentQuestion(session));
+  if (session.currentIndex >= QUESTIONS_PER_GAME - 1) {
+    parts.push(finishGame(session));
+    await saveSessions(globalData, sessions);
+    return send({ api, message, event }, parts.join("\n\n"));
+  }
+
+  nextQuestion(session);
+  await saveSessions(globalData, sessions);
+  parts.push(renderQuestion(session, prefix));
+  return send({ api, message, event }, parts.join("\n\n"));
+}
+
+async function showStats({ api, message, event, args, globalData, prefix }) {
+  const session = await getSession(event.threadID, globalData);
+  if (!session) return send({ api, message, event }, `📊 Aucune partie à afficher. Lance-en une avec ${prefix}animequizz.`);
+  const own = normalize(args && args[0]) === "moi";
+  if (own) {
+    const player = session.scores[String(event.senderID)] || { points: 0, correctAnswers: 0 };
+    return send({ api, message, event }, `📊 Tes résultats dans cette partie\n⭐ Points : ${player.points}\n✅ Bonnes réponses : ${player.correctAnswers}\n🧩 Questions : ${Math.min(session.currentIndex + (session.status === "finished" ? 1 : 0), QUESTIONS_PER_GAME)}/${QUESTIONS_PER_GAME}`);
+  }
+  const state = session.status === "finished" ? "Partie terminée" : `${questionLabel(session)} — ${session.phase === "open" ? "réponses ouvertes" : "réponses fermées"}`;
+  return send({ api, message, event }, `📊 QUIZ ANIME — ${state}\n${leaderboard(session)}`);
+}
+
+function invokedCommand(event, commandName) {
+  const body = String(event && event.body || "").trim();
+  const firstToken = body.split(/\s+/)[0] || "";
+  const fromBody = normalize(firstToken.replace(/^[^A-Za-z0-9]+/, ""));
+  const allowed = new Set(["animequiz", "animequizz", "reponse", "next", "animestats"]);
+  if (allowed.has(fromBody)) return fromBody;
+  return normalize(commandName);
+}
+
+async function handleCommand(context) {
+  const { api, message, event, args = [], prefix = "!", globalData } = context;
+  const threadID = String(event && event.threadID || "");
+  if (!threadID || !event || !event.senderID) return send({ api, message, event }, "❌ Conversation ou participant impossible à identifier.");
+
+  const invoked = invokedCommand(event, context.commandName);
+  const firstArg = normalize(args[0] || "");
+  if (invoked === "next" || firstArg === "next" || firstArg === "suivant") {
+    return advanceGame({ api, message, event, prefix, globalData });
+  }
+  if (invoked === "animestats" || firstArg === "stats") {
+    return showStats({ api, message, event, args: invoked === "animestats" ? args : args.slice(1), globalData, prefix });
+  }
+  if (invoked === "reponse" || ["reponse", "réponse", "answer"].includes(firstArg)) {
+    const value = invoked === "reponse" ? args[0] : args[1];
+    return submitAnswer(context, value);
+  }
+  if (["animequiz", "animequizz"].includes(invoked) && (parseChoice(args[0]) >= 0 || ["a", "b", "c", "d", "1", "2", "3", "4"].includes(firstArg))) {
+    return submitAnswer(context, args[0]);
+  }
+  if (["start", "commencer", "demarrer", "démarrer"].includes(firstArg)) {
+    return startGame({ api, message, event, prefix, globalData });
+  }
+
+  const existing = await getSession(threadID, globalData);
+  if (existing && existing.status === "active") {
+    const prompt = existing.phase === "open"
+      ? `⏳ Une partie est déjà en cours. Réponds avec ${prefix}réponse A-D ou écris ${prefix}next.`
+      : `⏳ Cette question est terminée. Écris ${prefix}next pour continuer.`;
+    return send({ api, message, event }, prompt);
+  }
+  return startGame({ api, message, event, prefix, globalData });
+}
+
+function serializeByThread(threadID, task) {
+  const key = String(threadID || "private");
+  const previous = threadQueue.get(key) || Promise.resolve();
+  const current = previous.catch(() => {}).then(task);
+  threadQueue.set(key, current);
+  return current.finally(() => {
+    if (threadQueue.get(key) === current) threadQueue.delete(key);
+  });
+}
+
+module.exports = {
+  config: {
+    name: "animequizz",
+    aliases: ["animequiz", "reponse", "réponse", "next", "animestats"],
+    version: "3.0.0",
+    author: "Diwate",
+    description: "Quiz anime en 10 questions, réponses A-D, points et classement",
+    category: "Anime",
+    usages: "animequizz | réponse A-D | next | animestats [moi]",
+    role: 0
+  },
+  QUESTION_BANK,
+  SESSION_KEY,
+  HISTORY_KEY,
+  QUESTIONS_PER_GAME,
+  parseChoice,
+  prepareQuestion,
+  renderQuestion,
+  leaderboard,
+  getSession,
+  startGame,
+  submitAnswer,
+  advanceGame,
+
+  onStart: async function (context) {
+    try {
+      return await serializeByThread(context.event && context.event.threadID, () => handleCommand(context));
+    } catch (error) {
+      console.error("[Commande animequiz]", error.stack || error);
+      return send({ api: context.api, message: context.message, event: context.event }, "❌ Le quiz n’a pas pu être traité. Réessaie.");
+    }
+  }
+};
