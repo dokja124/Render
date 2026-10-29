@@ -205,8 +205,9 @@ function renderQuestion(session, prefix = "!") {
     "",
     ...question.answers.map((answer, index) => `${ANSWER_LETTERS[index]}. ${answer}`),
     "",
-    `Réponds avec ${prefix}reponse A, B, C ou D (ou ${prefix}animequiz A-D).`,
-    `🏆 Les deux premiers gagnent des points : 3 pts puis 2 pts. Après deux bonnes réponses, il faudra écrire ${prefix}next.`
+    `Réponds avec ${prefix}réponse A, B, C ou D (ou ${prefix}animequizz A-D).`,
+    `🏆 Les deux premiers gagnent des points : 3 pts puis 2 pts. Après deux bonnes réponses, il faudra écrire ${prefix}next.`,
+    `🛑 Pour annuler la partie à tout moment : ${prefix}annulé.`
   ].join("\n");
 }
 
@@ -218,7 +219,7 @@ function leaderboard(session, title = "🏆 CLASSEMENT") {
       || order.indexOf(a.userID) - order.indexOf(b.userID)
       || String(a.userID).localeCompare(String(b.userID)));
   if (!rows.length) return `${title}\nAucun point marqué pour le moment.`;
-  return `${title}\n${rows.map((player, index) => `${index + 1}. ${player.name || player.userID} — ${player.points} pts (${player.correctAnswers} bonne(s) réponse(s))`).join("\n")}`;
+  return `${title}\n${rows.map((player, index) => `${index + 1}. ${player.name || "Joueur"} — ${player.points} pts (${player.correctAnswers} bonne(s) réponse(s))`).join("\n")}`;
 }
 
 function closeCurrentQuestion(session) {
@@ -273,6 +274,49 @@ function parseChoice(value) {
   return ANSWER_LETTERS.indexOf(text);
 }
 
+function usableDisplayName(value, userID) {
+  if (typeof value !== "string") return null;
+  const name = value.trim();
+  if (!name || name === String(userID) || /^\d{6,}$/.test(name)) return null;
+  return name.slice(0, 50);
+}
+
+async function resolveDisplayName(context, userID) {
+  const id = String(userID || "");
+  const event = context && context.event;
+  if (event && String(event.senderID || "") === id) {
+    const eventName = usableDisplayName(event.senderName, id);
+    if (eventName) return eventName;
+  }
+
+  const usersData = context && context.usersData;
+  if (usersData && typeof usersData.get === "function") {
+    try {
+      const profile = await usersData.get(id);
+      const cachedName = typeof profile === "string"
+        ? profile
+        : profile && (profile.name || profile.fullName || profile.nickname || profile.firstName);
+      const validName = usableDisplayName(cachedName, id);
+      if (validName) return validName;
+    } catch (error) {
+      console.warn("[Commande animequizz] Pseudo du profil local indisponible :", error.message);
+    }
+  }
+
+  const api = context && context.api;
+  if (api && typeof api.getUserInfo === "function") {
+    try {
+      const profiles = await api.getUserInfo([id]);
+      const profile = profiles && (profiles[id] || profiles[Number(id)]);
+      const apiName = usableDisplayName(profile && (profile.name || profile.firstName), id);
+      if (apiName) return apiName;
+    } catch (error) {
+      console.warn("[Commande animequizz] Pseudo Facebook indisponible :", error.message);
+    }
+  }
+  return null;
+}
+
 function nextQuestion(session) {
   session.currentIndex += 1;
   if (session.currentIndex >= QUESTIONS_PER_GAME) return false;
@@ -283,7 +327,8 @@ function nextQuestion(session) {
   return true;
 }
 
-async function submitAnswer({ api, message, event, args, prefix, globalData }, answerValue) {
+async function submitAnswer(context, answerValue) {
+  const { api, message, event, args, prefix, globalData } = context;
   const threadID = String(event.threadID);
   const userID = String(event.senderID || "");
   const sessions = await loadSessions(globalData);
@@ -301,14 +346,15 @@ async function submitAnswer({ api, message, event, args, prefix, globalData }, a
     return send({ api, message, event }, "❌ Mauvaise réponse. Tu peux encore réessayer tant que les deux places ne sont pas prises.");
   }
 
+  const playerName = await resolveDisplayName(context, userID);
   const place = session.current.correctUsers.length;
   const points = place === 0 ? 3 : 2;
   session.current.correctUsers.push(userID);
   if (!session.scores[userID]) {
-    session.scores[userID] = { name: String(event.senderName || userID).slice(0, 50), points: 0, correctAnswers: 0 };
+    session.scores[userID] = { name: playerName || "Joueur", points: 0, correctAnswers: 0 };
     session.scoreOrder.push(userID);
   }
-  session.scores[userID].name = String(event.senderName || session.scores[userID].name || userID).slice(0, 50);
+  session.scores[userID].name = playerName || session.scores[userID].name || "Joueur";
   session.scores[userID].points += points;
   session.scores[userID].correctAnswers += 1;
 
@@ -359,11 +405,27 @@ async function showStats({ api, message, event, args, globalData, prefix }) {
   return send({ api, message, event }, `📊 QUIZ ANIME — ${state}\n${leaderboard(session)}`);
 }
 
+async function cancelGame(context) {
+  const { api, message, event, globalData } = context;
+  const threadID = String(event && event.threadID || "");
+  if (!threadID) return send({ api, message, event }, "❌ Conversation impossible à identifier.");
+  const sessions = await loadSessions(globalData);
+  const session = sessions[threadID];
+  if (!session || session.status !== "active") {
+    return send({ api, message, event }, "ℹ️ Aucune partie de quiz active à annuler dans cette conversation.");
+  }
+  const actor = await resolveDisplayName(context, event.senderID) || "Un joueur";
+  const finalScore = leaderboard(session, "🏁 SCORE AU MOMENT DE L’ANNULATION");
+  delete sessions[threadID];
+  await saveSessions(globalData, sessions);
+  return send({ api, message, event }, `🛑 Partie annulée par ${actor}.\n\n${finalScore}`);
+}
+
 function invokedCommand(event, commandName) {
   const body = String(event && event.body || "").trim();
   const firstToken = body.split(/\s+/)[0] || "";
   const fromBody = normalize(firstToken.replace(/^[^A-Za-z0-9]+/, ""));
-  const allowed = new Set(["animequiz", "animequizz", "reponse", "next", "animestats"]);
+  const allowed = new Set(["animequiz", "animequizz", "reponse", "next", "animestats", "annule", "annuler", "cancel"]);
   if (allowed.has(fromBody)) return fromBody;
   return normalize(commandName);
 }
@@ -375,6 +437,9 @@ async function handleCommand(context) {
 
   const invoked = invokedCommand(event, context.commandName);
   const firstArg = normalize(args[0] || "");
+  if (["annule", "annuler", "cancel"].includes(invoked) || ["annule", "annuler", "cancel"].includes(firstArg)) {
+    return cancelGame(context);
+  }
   if (invoked === "next" || firstArg === "next" || firstArg === "suivant") {
     return advanceGame({ api, message, event, prefix, globalData });
   }
@@ -415,7 +480,7 @@ function serializeByThread(threadID, task) {
 module.exports = {
   config: {
     name: "animequizz",
-    aliases: ["animequiz", "reponse", "réponse", "next", "animestats"],
+    aliases: ["animequiz", "reponse", "réponse", "next", "animestats", "annule", "annulé", "annuler", "cancel"],
     version: "3.0.0",
     author: "Diwate",
     description: "Quiz anime en 10 questions, réponses A-D, points et classement",
@@ -435,6 +500,8 @@ module.exports = {
   startGame,
   submitAnswer,
   advanceGame,
+  resolveDisplayName,
+  cancelGame,
 
   onStart: async function (context) {
     try {

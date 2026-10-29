@@ -5,6 +5,7 @@ const path = require("path");
 const RANG_FILE = path.join(__dirname, "../../database/rang.json");
 const MAX_RECENT_IDS = 50;
 const XP_PER_ACTIVE_MINUTE = 5;
+const MESSAGES_PER_LEVEL = 100;
 let writeQueue = Promise.resolve();
 
 function emptyStore() {
@@ -97,8 +98,8 @@ function getMentionTarget(event) {
   };
 }
 
-function getLevel(xp) {
-  return Math.floor(Math.max(0, Number(xp) || 0) / 100);
+function getLevel(messages) {
+  return Math.floor(Math.max(0, Number(messages) || 0) / MESSAGES_PER_LEVEL);
 }
 
 function getTitle(level) {
@@ -172,7 +173,7 @@ module.exports = {
     name: "rang",
     version: "4.1.0",
     author: "Diwate",
-    description: "Affiche le nombre de messages, le titre, le niveau, l’XP et le rang",
+    description: "Affiche le titre, le niveau et la progression fondée sur les messages",
     category: "Général",
     usages: "rang [@mention]",
     role: 0
@@ -181,6 +182,7 @@ module.exports = {
   getStoredRankStats,
   getLevel,
   getTitle,
+  MESSAGES_PER_LEVEL,
   progressBar,
   getRankStats,
   rankInGroup,
@@ -211,45 +213,21 @@ module.exports = {
       const targetName = target.name || (mention && mention.name)
         || (String(event && (event.senderID || event.userID || event.author)) === targetID && event.senderName)
         || "Membre";
-      const xp = Math.max(0, Number(target.exp) || 0);
-      const level = getLevel(xp);
-      const title = getTitle(level);
-      const xpInLevel = xp % 100;
       const activity = getRankStats(await getStoredRankStats(targetID));
-
-      let groupRank = null;
-      if (event && event.threadID && api && typeof api.getThreadInfo === "function") {
-        try {
-          const info = await api.getThreadInfo(event.threadID);
-          if (Array.isArray(info && info.participantIDs)) {
-            groupRank = rankInGroup(allUsers, info.participantIDs, targetID);
-          }
-        } catch (threadError) {
-          console.warn("[Commande rang] Classement de conversation indisponible :", threadError.message);
-        }
-      }
-
-      const rankLine = groupRank
-        ? `🏆 Rang dans cette conversation : ${groupRank.position}/${groupRank.total} (selon l’XP)`
-        : "🏆 Rang de conversation : indisponible";
-      const lastActivity = activity.lastMessageAt
-        ? `🕒 Dernier message compté : ${new Date(activity.lastMessageAt).toLocaleString("fr-FR", { timeZone: "UTC" })} UTC`
-        : "🕒 Dernier message compté : aucun pour le moment";
+      const level = getLevel(activity.messages);
+      const title = getTitle(level);
+      const messagesInLevel = activity.messages % MESSAGES_PER_LEVEL;
+      const messagesRemaining = MESSAGES_PER_LEVEL - messagesInLevel;
 
       const lines = [
-        "╭━━━━━━〔 🏅 PROFIL & RANG 〕━━━━━━╮",
+        "╭━━━━━━〔 🏅 RANG 〕━━━━━━╮",
         `👤 ${targetName}`,
-        `🆔 ${targetID}`,
         "├────────────────────────",
         `🏷️ Titre : ${title}`,
         `🔰 Niveau : ${level}`,
-        `✨ XP : ${xp} / ${(level + 1) * 100} vers le niveau ${level + 1}`,
-        `📈 Progression : ${progressBar(xpInLevel, 100)} (${xpInLevel}/100 XP)`,
+        `📈 Progression : ${progressBar(messagesInLevel, MESSAGES_PER_LEVEL)} (${messagesInLevel}/${MESSAGES_PER_LEVEL} messages)`,
         `💬 Messages comptés : ${activity.messages}`,
-        rankLine,
-        lastActivity,
-        "├────────────────────────",
-        "ℹ️ Les compteurs et IDs récents sont stockés dans database/rang.json. Gain d’XP : +5 par minute active.",
+        `📨 Messages à envoyer pour le niveau ${level + 1} : ${messagesRemaining}`,
         "╰━━━━━━━━━━━━━━━━━━━━━━━━╯"
       ];
       return send({ api, message, event }, lines.join("\n"));
@@ -259,4 +237,3 @@ module.exports = {
     }
   }
 };
-    

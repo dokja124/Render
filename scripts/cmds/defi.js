@@ -212,12 +212,21 @@ function rulesText(prefix = "!") {
 
 function firstMention(event) {
   const mentions = event && event.mentions;
-  if (!mentions || typeof mentions !== "object") return null;
-  const id = Object.keys(mentions)[0];
-  if (!id) return null;
-  const raw = mentions[id];
-  const name = typeof raw === "string" ? raw : raw && (raw.name || raw.fullName);
-  return { id: String(id), name: name || "Ninja adverse" };
+  if (mentions && typeof mentions === "object") {
+    const id = Object.keys(mentions)[0];
+    if (id) {
+      const raw = mentions[id];
+      const name = typeof raw === "string" ? raw : raw && (raw.name || raw.fullName);
+      return { id: String(id), name: name || "Ninja adverse" };
+    }
+  }
+
+  const reply = event && (event.messageReply || event.replyTo || event.repliedMessage);
+  const replyID = reply && (reply.senderID || reply.senderId || reply.userID || reply.userFbId);
+  if (replyID && String(replyID) !== String(event.senderID || "")) {
+    return { id: String(replyID), name: String(reply.senderName || reply.name || reply.fullName || "Ninja adverse") };
+  }
+  return null;
 }
 
 function playerIndex(game, id) {
@@ -231,6 +240,11 @@ function statusMessage(game) {
 function challengeMessage(event, mention, prefix) {
   const sender = String(event.senderName || "Un ninja").slice(0, 40);
   return `${rulesText(prefix)}\n\n⚔️ ${sender} défie ${mention.name} !\n⏳ Le défi expire dans 15 minutes.\n✅ ${mention.name}, écris ${prefix}defi accepter pour choisir ton combattant, ou ${prefix}defi refuser.`;
+}
+
+function openChallengeMessage(event, prefix) {
+  const sender = String(event.senderName || "Un ninja").slice(0, 40);
+  return `${rulesText(prefix)}\n\n⚔️ ${sender} ouvre un défi dans cette conversation !\n✅ Un autre membre peut rejoindre le combat en écrivant ${prefix}defi accepter (ou ${prefix}defi accepté).`;
 }
 
 module.exports = {
@@ -283,20 +297,22 @@ module.exports = {
         game = null;
       }
 
-      if (["aide", "help", "regle", "regles", "rules"].includes(action) || action === "" && !mention) {
+      if (["aide", "help", "regle", "regles", "rules"].includes(action)) {
         return send({ api, message, event }, rulesText(commandPrefix));
       }
 
-      if (["accepter", "accept", "oui"].includes(action)) {
+      if (["accepter", "accepte", "acceptee", "accept", "accepted", "oui"].includes(action)) {
         if (!game || game.status !== "pending") return send({ api, message, event }, "ℹ️ Aucun défi en attente dans cette conversation.");
-        if (game.players[1].id !== userID) return send({ api, message, event }, "⛔ Seule la personne défiée peut accepter ce combat.");
+        if (game.players[0].id === userID) return send({ api, message, event }, "😅 La personne qui a lancé le défi ne peut pas l’accepter à sa place.");
+        if (game.players[1].id !== "*" && game.players[1].id !== userID) return send({ api, message, event }, "⛔ Seule la personne défiée peut accepter ce combat.");
         if (Date.now() - game.createdAt > PENDING_TIMEOUT) {
           delete games[threadID];
           await saveGames(globalData, games);
           return send({ api, message, event }, `⌛ Ce défi a expiré. Lance-en un nouveau avec ${commandPrefix}defi @mention.`);
         }
         const first = createPlayer(game.players[0].id, game.players[0].name);
-        const second = createPlayer(game.players[1].id, game.players[1].name, first.fighter);
+        const acceptedName = String(event.senderName || (game.players[1].id === "*" ? "Ninja" : game.players[1].name) || "Ninja").slice(0, 40);
+        const second = createPlayer(userID, acceptedName, first.fighter);
         game.players = [first, second];
         game.status = "active";
         game.turn = 0;
@@ -312,6 +328,26 @@ module.exports = {
         delete games[threadID];
         await saveGames(globalData, games);
         return send({ api, message, event }, "🚫 Le défi a été refusé/annulé.");
+      }
+
+      if (action === "" && !mention) {
+        if (game && game.status === "pending") {
+          const pendingText = game.players[1].id === "*"
+            ? `⏳ Défi ouvert de ${game.players[0].name} en attente. Un autre membre peut écrire ${commandPrefix}defi accepter ou ${commandPrefix}defi accepté.`
+            : `⏳ Défi en attente de ${game.players[1].name}. Relis les règles avec ${commandPrefix}defi règles.`;
+          return send({ api, message, event }, pendingText);
+        }
+        if (game && game.status === "active") return send({ api, message, event }, statusMessage(game));
+        games[threadID] = {
+          status: "pending",
+          createdAt: Date.now(),
+          players: [
+            { id: userID, name: String(event.senderName || "Ninja").slice(0, 40) },
+            { id: "*", name: "Un autre membre" }
+          ]
+        };
+        await saveGames(globalData, games);
+        return send({ api, message, event }, openChallengeMessage(event, commandPrefix));
       }
 
       if (mention && !COMBAT_ACTIONS.includes(action)) {
