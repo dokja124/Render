@@ -30,20 +30,19 @@ module.exports = {
     author: "Diwate",
     description: "Nomme administrateur le membre dont tu cites le message",
     category: "Groupe",
-    usages: "Réponds au message d’un membre avec !nomme",
+    usages: "Réponds au message du membre (ou au tien) avec !nomme",
     role: 0
   },
   normalizeIDs,
   getReplyTarget,
 
-  onStart: async function ({ api, message, event }) {
+  onStart: async function ({ api, message, event, role }) {
     try {
       const threadID = String(event && event.threadID || "");
       const callerID = String(event && (event.senderID || event.userID || event.author) || "");
       const target = getReplyTarget(event);
       if (!threadID || !callerID) return send({ api, message, event }, "❌ Impossible d’identifier le groupe ou la personne qui lance la commande.");
       if (!target) return send({ api, message, event }, "↩️ Réponds au message de la personne à nommer, puis écris !nomme.");
-      if (target.id === callerID) return send({ api, message, event }, "ℹ️ Tu es déjà la personne qui lance la commande; réponds au message d’un autre membre.");
       if (!api || typeof api.getThreadInfo !== "function" || typeof api.changeAdminStatus !== "function") {
         return send({ api, message, event }, "❌ L’API de gestion des administrateurs n’est pas disponible dans cette version du bot.");
       }
@@ -55,7 +54,14 @@ module.exports = {
       const adminIDs = normalizeIDs(threadInfo.adminIDs);
       const participantIDs = normalizeIDs(threadInfo.participantIDs);
       if (!participantIDs.includes(target.id)) return send({ api, message, event }, "❌ La personne visée n’est pas membre de ce groupe.");
-      if (!adminIDs.includes(callerID)) return send({ api, message, event }, "⛔ Seuls les administrateurs du groupe peuvent nommer un autre administrateur.");
+      const isSelfTarget = target.id === callerID;
+      const isGlobalBotAdmin = Number(role) === 2;
+      if (!adminIDs.includes(callerID) && !(isSelfTarget && isGlobalBotAdmin)) {
+        const reason = isSelfTarget
+          ? "⛔ Pour te nommer toi-même, tu dois être administrateur global du bot (rôle 2)."
+          : "⛔ Seuls les administrateurs du groupe peuvent nommer un autre administrateur.";
+        return send({ api, message, event }, reason);
+      }
 
       const botID = api && typeof api.getCurrentUserID === "function" ? String(api.getCurrentUserID() || "") : "";
       if (botID && !adminIDs.includes(botID)) {
@@ -78,4 +84,4 @@ module.exports = {
     }
   }
 };
-        
+      
