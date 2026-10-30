@@ -21,7 +21,7 @@ async function send({ api, message, event }, payload) {
 }
 
 const GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/interactions";
-const DEFAULT_MODEL = "gemini-3.8-flash";
+const DEFAULT_MODEL = "gemini-3.6-flash";
 const DEFAULT_OWNER_ID = "61571138559424";
 const PORTRAIT_PATH = path.join(__dirname, "assets", "raphael-tempest.jpg");
 const MAX_QUESTION_LENGTH = 4_000;
