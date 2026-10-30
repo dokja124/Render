@@ -90,6 +90,34 @@ const SERIES_ALIASES = {
   "Vinland Saga": ["Vinland Saga"]
 };
 
+const SERIES_CHARACTERS = {
+  "Naruto": "Naruto Uzumaki",
+  "One Piece": "Monkey D. Luffy",
+  "Dragon Ball": "Son Goku",
+  "Bleach": "Ichigo Kurosaki",
+  "Attack on Titan": "Eren Yeager",
+  "Demon Slayer: Kimetsu no Yaiba": "Tanjiro Kamado",
+  "Jujutsu Kaisen": "Yuji Itadori",
+  "My Hero Academia": "Izuku Midoriya",
+  "Hunter x Hunter": "Gon Freecss",
+  "Fullmetal Alchemist: Brotherhood": "Edward Elric",
+  "Death Note": "Light Yagami",
+  "Haikyu!!": "Shoyo Hinata",
+  "Blue Lock": "Yoichi Isagi",
+  "Spy x Family": "Anya Forger",
+  "Frieren: Beyond Journey’s End": "Frieren",
+  "Oshi no Ko": "Ai Hoshino",
+  "Chainsaw Man": "Denji",
+  "Dandadan": "Momo Ayase",
+  "Solo Leveling": "Sung Jinwoo",
+  "The Apothecary Diaries": "Maomao",
+  "Black Clover": "Asta",
+  "Ranma 1/2": "Ranma Saotome",
+  "Reincarnated as a Sword": "Fran",
+  "Toaru Anbu no ITEM": "Mugino Shizuri",
+  "Vinland Saga": "Thorfinn"
+};
+
 const ORIGINAL_LINES = [
   // Naruto — liens, entraînement et persévérance (8)
   ["On grandit en décidant que ses blessures ne choisiront plus à notre place.", "Naruto"],
@@ -344,7 +372,7 @@ const ORIGINAL_LINES = [
 
 const ORIGINAL_QUOTES = ORIGINAL_LINES.map(([text, anime]) => ({
   text,
-  character: "Phrase originale",
+  character: SERIES_CHARACTERS[anime] || "Personnage non attribué",
   anime,
   aliases: SERIES_ALIASES[anime] || [],
   original: true,
@@ -375,7 +403,7 @@ function selectQuote(filter) {
 module.exports = {
   config: {
     name: "citation",
-    version: "4.0.0",
+    version: "4.1.0",
     author: "Diwate",
     description: "Plus de 200 phrases d’anime, filtres par série et citations du moment",
     category: "Divertissement",
@@ -385,6 +413,7 @@ module.exports = {
   QUOTES,
   ORIGINAL_QUOTES,
   CURRENT_ANIME: [...CURRENT_ANIME],
+  SERIES_CHARACTERS,
   selectQuote,
   onStart: async function ({ api, message, event, args, prefix }) {
     const filter = Array.isArray(args) ? args.join(" ").trim() : "";
@@ -394,17 +423,15 @@ module.exports = {
       return send({ api, message, event }, `🔎 Aucune citation trouvée pour « ${filter} ». Essaie un titre comme : ${examples}. Pour les séries diffusées récemment, écris ${prefix || "!"}citation actuel.`);
     }
     const isCurrentRequest = CURRENT_FILTERS.has(normalize(filter));
-    const intro = quote.original
-      ? `🎌 Phrase originale inspirée de ${quote.anime}${quote.current ? " · anime du moment" : ""}`
-      : filter
-        ? `🎌 Citation ${quote.anime}`
-        : "🎌 Citation d’anime au hasard";
-    const attribution = quote.original
-      ? `— Phrase originale, inspiration : ${quote.anime}\nℹ️ Ce n’est pas une réplique officielle.`
-      : `— ${quote.character} (${quote.anime})`;
+    const heading = quote.original ? "✨ PHRASE ORIGINALE INSPIRÉE D’UN ANIME" : "💬 CITATION D’ANIME";
+    const animeLine = `🎞️ Anime : ${quote.anime}${quote.current ? " · anime du moment" : ""}`;
+    const characterLine = quote.original
+      ? `🎭 Personnage associé : ${quote.character}\nℹ️ Phrase originale : ce personnage ne l’a pas prononcée dans l’anime.`
+      : `🎭 Personnage : ${quote.character}`;
     const tip = isCurrentRequest
       ? `\n\n🔎 Filtre par série : ${prefix || "!"}citation Black Clover`
       : `\n\n💡 Filtre : ${prefix || "!"}citation Naruto · anime du moment : ${prefix || "!"}citation actuel`;
-    return send({ api, message, event }, `${intro}\n\n💬 « ${quote.text} »\n${attribution}${tip}`);
+    const card = `╭━━━〔 ${heading} 〕━━━╮\n${animeLine}\n${characterLine}\n\n📝 « ${quote.text} »\n╰━━━━━━━━━━━━━━━━━━━━━━╯${tip}`;
+    return send({ api, message, event }, card);
   }
 };
