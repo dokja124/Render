@@ -19,7 +19,9 @@ async function getState(globalData) {
     return { ...cachedState };
   }
   try {
-    cachedState = normalizeState(await globalData.get(STORAGE_KEY, "data", null));
+    // Un fallback truthy crée la clé dans le contrôleur Goat-Bot. Avec null,
+    // get() renvoie undefined sans créer l’enregistrement, puis set() échoue.
+    cachedState = normalizeState(await globalData.get(STORAGE_KEY, "data", {}));
   } catch (error) {
     console.error("[Commande off] Lecture du mode impossible :", error.message);
     cachedState = normalizeState(null);
@@ -121,3 +123,4 @@ module.exports = {
   _installGuard: installGuard,
   _resetForTests() { cachedState = null; }
 };
+  
