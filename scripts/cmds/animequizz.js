@@ -3,10 +3,13 @@ const { send } = require("./lib/messenger");
 const SESSION_KEY = "animeQuizSessionsV3";
 const HISTORY_KEY = "animeQuizQuestionHistoryV3";
 const QUESTIONS_PER_GAME = 10;
+const QUESTION_DURATION_MS = 10_000;
+const WARNING_AFTER_MS = 5_000;
 const ANSWER_LETTERS = ["A", "B", "C", "D"];
 let memorySessions = {};
 let memoryHistory = {};
 let commandQueue = Promise.resolve();
+const activeQuestionTimers = new Map();
 
 function q(id, series, text, answers, correct) {
   return { id, series, text, answers, correct };
@@ -124,7 +127,11 @@ function prepareQuestion(question) {
     answers: options.map(option => option.text),
     correctIndex: options.findIndex(option => option.correct),
     correctUsers: [],
-    wrongUsers: []
+    wrongUsers: [],
+    answerRecords: {},
+    questionStartedAt: 0,
+    questionEndsAt: 0,
+    warningSent: false
   };
 }
 
@@ -206,7 +213,10 @@ function renderQuestion(session, prefix = "!") {
     ...question.answers.map((answer, index) => `${ANSWER_LETTERS[index]}. ${answer}`),
     "",
     `Réponds avec ${prefix}réponse A, B, C ou D (ou ${prefix}animequizz A-D).`,
-    `🏆 Les deux premiers gagnent des points : 3 pts puis 2 pts. Après deux bonnes réponses, il faudra écrire ${prefix}next.`,
+    "⏱️ Tu as 10 secondes. Un avertissement sera envoyé après 5 secondes.",
+    "🏆 Barème : 1er correct +3 pts · 2e +2 pts · 3e +1 pt · suivants +0 pt (réponse enregistrée).",
+    "🔒 Une seule réponse par joueur pour cette question, même si elle est incorrecte : aucun changement possible.",
+    `⏭️ À la fermeture, les résultats s’affichent; écris ${prefix}next pour continuer.`,
     `🛑 Pour annuler la partie à tout moment : ${prefix}annulé.`
   ].join("\n");
 }
@@ -222,13 +232,43 @@ function leaderboard(session, title = "🏆 CLASSEMENT") {
   return `${title}\n${rows.map((player, index) => `${index + 1}. ${player.name || "Joueur"} — ${player.points} pts (${player.correctAnswers} bonne(s) réponse(s))`).join("\n")}`;
 }
 
-function closeCurrentQuestion(session) {
+function ensureQuestionState(question) {
+  if (!Array.isArray(question.correctUsers)) question.correctUsers = [];
+  if (!Array.isArray(question.wrongUsers)) question.wrongUsers = [];
+  if (!question.answerRecords || typeof question.answerRecords !== "object" || Array.isArray(question.answerRecords)) question.answerRecords = {};
+  for (const userID of [...question.correctUsers, ...question.wrongUsers]) {
+    if (!question.answerRecords[String(userID)]) {
+      question.answerRecords[String(userID)] = { choice: null, correct: question.correctUsers.includes(userID), points: 0, answeredAt: 0, name: "Joueur" };
+    }
+  }
+  return question;
+}
+
+function answerSummary(question) {
+  const records = Object.entries(ensureQuestionState(question).answerRecords)
+    .sort((a, b) => (Number(a[1].answeredAt) || 0) - (Number(b[1].answeredAt) || 0) || a[0].localeCompare(b[0]));
+  if (!records.length) return "📝 Aucune réponse n’a été reçue.";
+  const lines = records.map(([, record]) => {
+    const choice = Number.isInteger(record.choice) && record.choice >= 0 && record.choice < ANSWER_LETTERS.length
+      ? `${ANSWER_LETTERS[record.choice]}. ${question.answers[record.choice]}`
+      : "réponse antérieure";
+    const result = record.correct ? `correcte, +${Number(record.points) || 0} pt(s)` : "incorrecte, 0 pt";
+    return `• ${record.name || "Joueur"} — ${choice} · ${result}`;
+  });
+  return `📝 Réponses enregistrées :\n${lines.join("\n")}`;
+}
+
+function closeCurrentQuestion(session, prefix = "!") {
+  if (session.phase === "closed") return "🔒 Cette question est déjà fermée.";
   session.phase = "closed";
+  session.current.closedAt = Date.now();
   const question = session.current;
   const correctLetter = ANSWER_LETTERS[question.correctIndex];
   return [
     `🔒 Réponses fermées — ${questionLabel(session)}.`,
     `✅ Bonne réponse : ${correctLetter}. ${question.answers[question.correctIndex]}`,
+    answerSummary(question),
+    `⏭️ Écris ${prefix}next pour passer à la suite.`,
     leaderboard(session, "🏆 Classement après cette question")
   ].join("\n");
 }
@@ -245,11 +285,19 @@ async function startGame({ api, message, event, prefix, globalData }) {
   const old = sessions[threadID];
   if (old && old.status === "active") {
     if (old.phase === "open") {
-      return send({ api, message, event }, `⏳ Une partie est déjà en cours. Réponds à la question ou écris ${prefix}next pour la fermer et passer à la suite.`);
+      ensureQuestionState(old.current);
+      if (!Number(old.current.questionStartedAt) || !Number(old.current.questionEndsAt)) {
+        startQuestionClock(old);
+        await saveSessions(globalData, sessions);
+      }
+      scheduleQuestionTimers({ api, message, event, prefix, globalData }, old);
+      const remaining = Math.max(0, Math.ceil((Number(old.current.questionEndsAt) - Date.now()) / 1000));
+      return send({ api, message, event }, `⏳ Une partie est déjà en cours. Réponds à la question; elle se fermera automatiquement dans ${remaining} seconde(s). Ensuite, écris ${prefix}next.`);
     }
     return send({ api, message, event }, `⏳ La question est terminée. Écris ${prefix}next pour continuer.`);
   }
 
+  clearQuestionTimers(threadID);
   const questionIds = await selectQuestionIDs(threadID, globalData);
   const firstQuestion = QUESTION_BY_ID.get(questionIds[0]);
   const session = {
@@ -265,7 +313,11 @@ async function startGame({ api, message, event, prefix, globalData }) {
   };
   sessions[threadID] = session;
   await saveSessions(globalData, sessions);
-  return send({ api, message, event }, `🎉 Nouvelle partie : 10 questions, quatre choix par question, et des questions renouvelées d’une partie à l’autre.\n\n${renderQuestion(session, prefix)}`);
+  const response = await send({ api, message, event }, `🎉 Nouvelle partie : 10 questions, quatre choix par question, et des questions renouvelées d’une partie à l’autre.\n\n${renderQuestion(session, prefix)}`);
+  startQuestionClock(session);
+  await saveSessions(globalData, sessions);
+  scheduleQuestionTimers({ api, message, event, prefix, globalData }, session);
+  return response;
 }
 
 function parseChoice(value) {
@@ -335,41 +387,62 @@ async function submitAnswer(context, answerValue) {
   const session = sessions[threadID];
   if (!session) return send({ api, message, event }, `❓ Aucune partie en cours. Lance-en une avec ${prefix}animequizz.`);
   if (session.status === "finished") return send({ api, message, event }, `🏁 Cette partie est terminée. Lance une nouvelle partie avec ${prefix}animequizz.`);
+  if (session.phase === "open") {
+    ensureQuestionState(session.current);
+    if (!Number(session.current.questionStartedAt) || !Number(session.current.questionEndsAt)) {
+      startQuestionClock(session);
+      await saveSessions(globalData, sessions);
+    }
+    scheduleQuestionTimers(context, session);
+    if (Date.now() >= Number(session.current.questionEndsAt)) {
+      const result = closeCurrentQuestion(session, prefix);
+      clearQuestionTimers(threadID, session.current.id);
+      await saveSessions(globalData, sessions);
+      return send({ api, message, event }, `${result}\n⌛ Le délai de 10 secondes est écoulé; aucune réponse tardive n’est acceptée.`);
+    }
+  }
   if (session.phase !== "open") return send({ api, message, event }, `🔒 Les réponses sont fermées pour cette question. Écris ${prefix}next pour continuer.`);
   if (!userID) return send({ api, message, event }, "❌ Impossible d’identifier le participant.");
-  if (session.current.correctUsers.includes(userID)) return send({ api, message, event }, "✅ Ta bonne réponse a déjà été comptée pour cette question.");
-  if (session.current.correctUsers.length >= 2) return send({ api, message, event }, `🔒 Les deux places sont prises. Écris ${prefix}next pour continuer.`);
+  if (Object.prototype.hasOwnProperty.call(session.current.answerRecords, userID)) {
+    return send({ api, message, event }, "🔒 Ta première réponse est déjà enregistrée pour cette question. Tu ne peux pas la modifier.");
+  }
 
   const choice = parseChoice(answerValue || args && args[0]);
   if (choice < 0 || choice > 3) return send({ api, message, event }, `🔢 Choisis A, B, C ou D avec ${prefix}réponse A-D.`);
-  if (choice !== session.current.correctIndex) {
-    return send({ api, message, event }, "❌ Mauvaise réponse. Tu peux encore réessayer tant que les deux places ne sont pas prises.");
-  }
-
   const playerName = await resolveDisplayName(context, userID);
-  const place = session.current.correctUsers.length;
-  const points = place === 0 ? 3 : 2;
-  session.current.correctUsers.push(userID);
+  session.scores = session.scores && typeof session.scores === "object" ? session.scores : {};
+  session.scoreOrder = Array.isArray(session.scoreOrder) ? session.scoreOrder : [];
   if (!session.scores[userID]) {
     session.scores[userID] = { name: playerName || "Joueur", points: 0, correctAnswers: 0 };
     session.scoreOrder.push(userID);
   }
   session.scores[userID].name = playerName || session.scores[userID].name || "Joueur";
-  session.scores[userID].points += points;
-  session.scores[userID].correctAnswers += 1;
-
-  if (session.current.correctUsers.length === 1) {
-    await saveSessions(globalData, sessions);
-    return send({ api, message, event }, `✅ Bonne réponse, ${session.scores[userID].name} ! Tu es le/la premier(ère) : +3 points. Il reste une place pour une deuxième bonne réponse.`);
+  const correct = choice === session.current.correctIndex;
+  let place = 0;
+  let points = 0;
+  if (correct) {
+    place = session.current.correctUsers.length + 1;
+    points = [3, 2, 1][place - 1] || 0;
+    session.current.correctUsers.push(userID);
+    session.scores[userID].points += points;
+    session.scores[userID].correctAnswers += 1;
+  } else {
+    session.current.wrongUsers.push(userID);
   }
-
-  const reveal = closeCurrentQuestion(session);
-  const announcement = `✅ Bonne réponse, ${session.scores[userID].name} ! Tu es deuxième : +2 points.\n\n${reveal}`;
-  let response = announcement;
-  if (session.currentIndex === QUESTIONS_PER_GAME - 1) response += `\n\n${finishGame(session)}`;
-  else response += `\n\nÉcris ${prefix}next pour afficher la prochaine question.`;
+  session.current.answerRecords[userID] = {
+    choice,
+    correct,
+    points,
+    answeredAt: Date.now(),
+    name: session.scores[userID].name
+  };
   await saveSessions(globalData, sessions);
-  return send({ api, message, event }, response);
+  if (!correct) {
+    return send({ api, message, event }, "❌ Réponse incorrecte, mais elle est enregistrée. Tu ne peux pas la modifier pendant cette question; le résultat sera affiché à la fermeture.");
+  }
+  const ordinal = place === 1 ? "1er/1re" : `${place}e`;
+  const pointsText = points ? `+${points} point(s)` : "0 point (places à points déjà attribuées)";
+  return send({ api, message, event }, `✅ Bonne réponse, ${session.scores[userID].name} ! Tu es ${ordinal} parmi les bonnes réponses : ${pointsText}. Le chrono continue jusqu’à 10 secondes; chaque joueur ne peut répondre qu’une fois à cette question.`);
 }
 
 async function advanceGame({ api, message, event, prefix, globalData }) {
@@ -377,31 +450,62 @@ async function advanceGame({ api, message, event, prefix, globalData }) {
   const sessions = await loadSessions(globalData);
   const session = sessions[threadID];
   if (!session) return send({ api, message, event }, `❓ Aucune partie en cours. Lance-en une avec ${prefix}animequizz.`);
-  if (session.status === "finished") return send({ api, message, event }, finishGame(session));
+  if (session.status === "finished") return send({ api, message, event }, leaderboard(session, "🏆 CLASSEMENT FINAL — QUIZ TERMINÉ"));
 
-  const parts = [];
-  if (session.phase === "open") parts.push(closeCurrentQuestion(session));
-  if (session.currentIndex >= QUESTIONS_PER_GAME - 1) {
-    parts.push(finishGame(session));
+  if (session.phase === "open") {
+    ensureQuestionState(session.current);
+    if (!Number(session.current.questionStartedAt) || !Number(session.current.questionEndsAt)) {
+      startQuestionClock(session);
+      await saveSessions(globalData, sessions);
+    }
+    scheduleQuestionTimers({ api, message, event, prefix, globalData }, session);
+    const remaining = Number(session.current.questionEndsAt) - Date.now();
+    if (remaining > 0) {
+      return send({ api, message, event }, `⏳ Il reste ${Math.ceil(remaining / 1000)} seconde(s). La question reste ouverte jusqu’à la fin du chrono; tu pourras écrire ${prefix}next après l’affichage des résultats.`);
+    }
+    const result = closeCurrentQuestion(session, prefix);
+    clearQuestionTimers(threadID, session.current.id);
     await saveSessions(globalData, sessions);
-    return send({ api, message, event }, parts.join("\n\n"));
+    return send({ api, message, event }, result);
   }
 
+  if (session.currentIndex >= QUESTIONS_PER_GAME - 1) {
+    const finalResult = finishGame(session);
+    clearQuestionTimers(threadID);
+    await saveSessions(globalData, sessions);
+    return send({ api, message, event }, finalResult);
+  }
+
+  clearQuestionTimers(threadID);
   nextQuestion(session);
   await saveSessions(globalData, sessions);
-  parts.push(renderQuestion(session, prefix));
-  return send({ api, message, event }, parts.join("\n\n"));
+  const response = await send({ api, message, event }, renderQuestion(session, prefix));
+  startQuestionClock(session);
+  await saveSessions(globalData, sessions);
+  scheduleQuestionTimers({ api, message, event, prefix, globalData }, session);
+  return response;
 }
 
 async function showStats({ api, message, event, args, globalData, prefix }) {
-  const session = await getSession(event.threadID, globalData);
+  const sessions = await loadSessions(globalData);
+  const session = sessions[String(event.threadID || "")];
   if (!session) return send({ api, message, event }, `📊 Aucune partie à afficher. Lance-en une avec ${prefix}animequizz.`);
+  if (session.status === "active" && session.phase === "open") {
+    if (!Number(session.current.questionStartedAt) || !Number(session.current.questionEndsAt)) {
+      startQuestionClock(session);
+      await saveSessions(globalData, sessions);
+    }
+    scheduleQuestionTimers({ api, message, event, prefix, globalData }, session);
+  }
   const own = normalize(args && args[0]) === "moi";
   if (own) {
     const player = session.scores[String(event.senderID)] || { points: 0, correctAnswers: 0 };
     return send({ api, message, event }, `📊 Tes résultats dans cette partie\n⭐ Points : ${player.points}\n✅ Bonnes réponses : ${player.correctAnswers}\n🧩 Questions : ${Math.min(session.currentIndex + (session.status === "finished" ? 1 : 0), QUESTIONS_PER_GAME)}/${QUESTIONS_PER_GAME}`);
   }
-  const state = session.status === "finished" ? "Partie terminée" : `${questionLabel(session)} — ${session.phase === "open" ? "réponses ouvertes" : "réponses fermées"}`;
+  const timeLeft = session.status === "active" && session.phase === "open"
+    ? ` (${Math.max(0, Math.ceil((Number(session.current.questionEndsAt) - Date.now()) / 1000))} s restantes)`
+    : "";
+  const state = session.status === "finished" ? "Partie terminée" : `${questionLabel(session)} — ${session.phase === "open" ? `réponses ouvertes${timeLeft}` : "réponses fermées"}`;
   return send({ api, message, event }, `📊 QUIZ ANIME — ${state}\n${leaderboard(session)}`);
 }
 
@@ -417,6 +521,7 @@ async function cancelGame(context) {
   const actor = await resolveDisplayName(context, event.senderID) || "Un joueur";
   const finalScore = leaderboard(session, "🏁 SCORE AU MOMENT DE L’ANNULATION");
   delete sessions[threadID];
+  clearQuestionTimers(threadID);
   await saveSessions(globalData, sessions);
   return send({ api, message, event }, `🛑 Partie annulée par ${actor}.\n\n${finalScore}`);
 }
@@ -457,10 +562,18 @@ async function handleCommand(context) {
     return startGame({ api, message, event, prefix, globalData });
   }
 
-  const existing = await getSession(threadID, globalData);
+  const sessions = await loadSessions(globalData);
+  const existing = sessions[threadID];
   if (existing && existing.status === "active") {
+    if (existing.phase === "open") {
+      if (!Number(existing.current.questionStartedAt) || !Number(existing.current.questionEndsAt)) {
+        startQuestionClock(existing);
+        await saveSessions(globalData, sessions);
+      }
+      scheduleQuestionTimers({ ...context, prefix }, existing);
+    }
     const prompt = existing.phase === "open"
-      ? `⏳ Une partie est déjà en cours. Réponds avec ${prefix}réponse A-D ou écris ${prefix}next.`
+      ? `⏳ Une partie est déjà en cours. Réponds avec ${prefix}réponse A-D; la question se ferme automatiquement après 10 secondes. Écris ${prefix}next après les résultats.`
       : `⏳ Cette question est terminée. Écris ${prefix}next pour continuer.`;
     return send({ api, message, event }, prompt);
   }
@@ -477,29 +590,127 @@ function serializeByThread(threadID, task) {
   });
 }
 
+function clearQuestionTimers(threadID, questionID) {
+  const key = String(threadID || "");
+  const timers = activeQuestionTimers.get(key);
+  if (!timers || (questionID && timers.questionID !== questionID)) return;
+  clearTimeout(timers.warningTimer);
+  clearTimeout(timers.closeTimer);
+  activeQuestionTimers.delete(key);
+}
+
+function startQuestionClock(session, now = Date.now()) {
+  ensureQuestionState(session.current);
+  session.current.questionStartedAt = now;
+  session.current.questionEndsAt = now + QUESTION_DURATION_MS;
+  session.current.warningSent = false;
+  return session.current.questionEndsAt;
+}
+
+async function sendQuestionWarning(context, questionID) {
+  const { api, message, event, globalData, prefix = "!" } = context;
+  const threadID = String(event && event.threadID || "");
+  const sessions = await loadSessions(globalData);
+  const session = sessions[threadID];
+  if (!session || session.status !== "active" || session.phase !== "open" || session.current.id !== questionID) return false;
+  ensureQuestionState(session.current);
+  if (session.current.warningSent || Date.now() >= Number(session.current.questionEndsAt)) return false;
+  const secondsLeft = Math.max(1, Math.ceil((Number(session.current.questionEndsAt) - Date.now()) / 1000));
+  session.current.warningSent = true;
+  await saveSessions(globalData, sessions);
+  await send({ api, message, event }, `⏳ Il reste ${secondsLeft} seconde(s) pour répondre à ${questionLabel(session)} ! Ta réponse est verrouillée dès le premier envoi. Après la fermeture, écris ${prefix}next.`);
+  return true;
+}
+
+async function closeTimedQuestion(context, questionID) {
+  const { api, message, event, globalData, prefix = "!" } = context;
+  const threadID = String(event && event.threadID || "");
+  const sessions = await loadSessions(globalData);
+  const session = sessions[threadID];
+  if (!session || session.status !== "active" || session.phase !== "open" || session.current.id !== questionID) {
+    clearQuestionTimers(threadID, questionID);
+    return false;
+  }
+  ensureQuestionState(session.current);
+  if (Date.now() < Number(session.current.questionEndsAt)) {
+    clearQuestionTimers(threadID, questionID);
+    scheduleQuestionTimers(context, session);
+    return false;
+  }
+  const result = closeCurrentQuestion(session, prefix);
+  clearQuestionTimers(threadID, questionID);
+  await saveSessions(globalData, sessions);
+  await send({ api, message, event }, result);
+  return true;
+}
+
+function scheduleQuestionTimers(context, session) {
+  const event = context && context.event;
+  const threadID = String(event && event.threadID || "");
+  if (!threadID || !session || session.status !== "active" || session.phase !== "open") return false;
+  ensureQuestionState(session.current);
+  if (!Number(session.current.questionStartedAt) || !Number(session.current.questionEndsAt)) startQuestionClock(session);
+  const questionID = String(session.current.id || "");
+  const existing = activeQuestionTimers.get(threadID);
+  if (existing && existing.questionID === questionID) return true;
+  clearQuestionTimers(threadID);
+
+  const now = Date.now();
+  const warnAt = Number(session.current.questionStartedAt) + WARNING_AFTER_MS;
+  const endAt = Number(session.current.questionEndsAt);
+  const makeTimer = (callback, delay) => {
+    const timer = setTimeout(() => {
+      const task = callback();
+      if (task && typeof task.catch === "function") {
+        task.catch(error => console.error("[Animequizz timer]", error.message));
+        return task;
+      }
+      return task;
+    }, Math.max(0, delay));
+    if (timer && typeof timer.unref === "function") timer.unref();
+    return timer;
+  };
+
+  const warningTimer = !session.current.warningSent && now < endAt
+    ? makeTimer(() => serializeByThread(threadID, () => sendQuestionWarning(context, questionID)), warnAt - now)
+    : null;
+  const closeTimer = makeTimer(() => serializeByThread(threadID, () => closeTimedQuestion(context, questionID)), endAt - now);
+  activeQuestionTimers.set(threadID, { questionID, warningTimer, closeTimer });
+  return true;
+}
+
 module.exports = {
   config: {
     name: "animequizz",
     aliases: ["animequiz", "reponse", "réponse", "next", "animestats", "annule", "annulé", "annuler", "cancel"],
-    version: "3.0.0",
+    version: "3.1.0",
     author: "Diwate",
-    description: "Quiz anime en 10 questions, réponses A-D, points et classement",
+    description: "Quiz anime chronométré en 10 questions avec réponses verrouillées et classement",
     category: "Anime",
-    usages: "animequizz | réponse A-D | next | animestats [moi]",
+    usages: "animequizz | réponse A-D | next (après 10 secondes) | animestats [moi]",
     role: 0
   },
   QUESTION_BANK,
   SESSION_KEY,
   HISTORY_KEY,
   QUESTIONS_PER_GAME,
+  QUESTION_DURATION_MS,
+  WARNING_AFTER_MS,
   parseChoice,
   prepareQuestion,
   renderQuestion,
+  ensureQuestionState,
+  answerSummary,
+  closeCurrentQuestion,
   leaderboard,
   getSession,
   startGame,
   submitAnswer,
   advanceGame,
+  scheduleQuestionTimers,
+  sendQuestionWarning,
+  closeTimedQuestion,
+  clearQuestionTimers,
   resolveDisplayName,
   cancelGame,
 

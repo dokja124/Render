@@ -188,13 +188,14 @@ module.exports = {
   rankInGroup,
   getMessageIdentity,
   countMessage,
-  onEvent: countMessage,
-  onAnyEvent: countMessage,
+  // Goat-Bot appelle onChat pour les messages message/message_reply.
+  // onAnyEvent n'est pas branché dans le handlerAction actif de ce projet.
+  onChat: countMessage,
 
   onStart: async function ({ api, message, event, usersData }) {
     try {
       // Repli fiable : compte aussi le message !rang lui-même si le hook d’événement est retardé.
-      // incrementMessage déduplique le même message reçu via onEvent/onAnyEvent.
+      // incrementMessage déduplique le message si onChat l’a déjà compté.
       await countMessage({ event, usersData });
       const mention = getMentionTarget(event);
       const targetID = mention && mention.id || String(event && (event.senderID || event.userID || event.author) || "");
