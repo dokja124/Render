@@ -98,6 +98,7 @@ async function removeSpammer(context, threadID, senderID) {
   const lockKey = `${threadID}:${senderID}`;
   if (removalInProgress.has(lockKey)) return false;
   removalInProgress.add(lockKey);
+  let adminDemoted = false;
 
   try {
     if (!api || typeof api.getThreadInfo !== "function" || typeof api.removeUserFromGroup !== "function") {
@@ -112,25 +113,42 @@ async function removeSpammer(context, threadID, senderID) {
     if (!participantIDs.includes(senderID)) return false;
 
     const adminIDs = normalizeIDs(threadInfo.adminIDs);
-    // Le bot ne retire ni ses propres comptes ni les administrateurs du groupe.
-    if (adminIDs.includes(senderID)) {
-      await sendText(context, "ℹ️ Anti-spam : un administrateur du groupe a dépassé le seuil; il n’a pas été retiré automatiquement.");
-      return false;
-    }
-
     const botID = typeof api.getCurrentUserID === "function" ? String(api.getCurrentUserID() || "") : "";
+    // Le compte du bot reste protégé pour éviter de couper lui-même sa connexion au groupe.
+    if (botID && senderID === botID) return false;
     if (!botID || !adminIDs.includes(botID)) {
       await sendText(context, "⚠️ Anti-spam détecté, mais le compte du bot doit être administrateur du groupe pour retirer un membre.");
       return false;
     }
 
+    if (adminIDs.includes(senderID)) {
+      if (typeof api.changeAdminStatus !== "function") {
+        await sendText(context, "⚠️ Anti-spam : le membre est administrateur, mais l’API ne permet pas de retirer son statut; il n’a pas été exclu.");
+        return false;
+      }
+      try {
+        await api.changeAdminStatus(threadID, [senderID], false);
+        adminDemoted = true;
+      } catch (error) {
+        console.warn("[Anti-spam] Impossible de retirer le statut admin :", String(error && (error.code || error.message) || "erreur inconnue").slice(0, 140));
+        await sendText(context, "❌ Anti-spam : je n’ai pas pu retirer le statut administrateur; le membre n’a pas été exclu.");
+        return false;
+      }
+    }
+
     const memberName = await getMemberName(threadInfo, event, senderID, usersData);
     await api.removeUserFromGroup(senderID, threadID);
-    await sendText(context, `🛡️ Anti-spam : ${memberName} a été retiré du groupe après ${REPEAT_LIMIT} envois identiques en moins de ${WINDOW_MS / 1000} secondes.`);
+    const actionText = adminDemoted
+      ? `${memberName} a perdu son statut administrateur puis a été retiré du groupe`
+      : `${memberName} a été retiré du groupe`;
+    await sendText(context, `🛡️ Anti-spam : ${actionText} après ${REPEAT_LIMIT} envois identiques en moins de ${WINDOW_MS / 1000} secondes.`);
     return true;
   } catch (error) {
     console.warn("[Anti-spam] Échec du retrait d’un membre :", String(error && (error.code || error.message) || "erreur inconnue").slice(0, 160));
-    await sendText(context, "❌ Anti-spam : le retrait a échoué. Vérifie que le bot est toujours administrateur du groupe.");
+    const failureText = adminDemoted
+      ? "❌ Anti-spam : le statut administrateur a été retiré, mais l’exclusion a échoué. Vérifie les droits du bot et retire ce membre manuellement si nécessaire."
+      : "❌ Anti-spam : le retrait a échoué. Vérifie que le bot est toujours administrateur du groupe.";
+    await sendText(context, failureText);
     return false;
   } finally {
     removalInProgress.delete(lockKey);
@@ -171,7 +189,7 @@ async function monitorMessage(context) {
 module.exports = {
   config: {
     name: "anti-spam",
-    version: "1.0.0",
+    version: "1.1.0",
     author: "Diwate",
     description: "Active ou désactive l’anti-spam pour un groupe Messenger",
     category: "Groupe",
@@ -248,7 +266,7 @@ module.exports = {
         }
       }
       const details = enable
-        ? `✅🛡️ Anti-spam activé pour ce groupe. Un membre non-administrateur qui envoie le même texte ${REPEAT_LIMIT} fois en moins de ${WINDOW_MS / 1000} secondes sera retiré.`
+        ? `✅🛡️ Anti-spam activé pour ce groupe. Tout membre, même administrateur, qui envoie le même texte ${REPEAT_LIMIT} fois en moins de ${WINDOW_MS / 1000} secondes sera rétrogradé si nécessaire puis retiré.`
         : "🚫 Anti-spam désactivé pour ce groupe. Aucun membre ne sera retiré pour des répétitions de message.";
       return send({ api, message, event }, details);
     } catch (error) {
