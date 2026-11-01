@@ -20,12 +20,11 @@ const CATEGORY_EMOJI = {
 };
 
 // Le fichier local doit être inclus dans scripts/cmds/assets lors du déploiement Render.
+const VIDEO_URL = "https://files.catbox.moe/istabd.mp4";
 const VIDEO_PATH = path.join(__dirname, "assets", "menu-video.mp4");
 const MAX_VIDEO_BYTES = 25 * 1024 * 1024;
 const MAX_MESSAGE_BYTES = 1800;
-const PAGE_CONTENT_RESERVE_BYTES = 650;
 const DESCRIPTION_MAX_CHARS = 96;
-const MAX_VISIBLE_ALIASES = 3;
 
 function cleanText(value, fallback = "") {
   if (value == null) return fallback;
@@ -82,7 +81,7 @@ function getCommandEntries(commands) {
   return entries;
 }
 
-function makeSections(entries, prefix) {
+function makeSections(entries) {
   const grouped = new Map();
   for (const entry of entries) {
     if (!grouped.has(entry.category)) grouped.set(entry.category, []);
@@ -93,76 +92,51 @@ function makeSections(entries, prefix) {
     .sort(([a], [b]) => a.localeCompare(b, "fr", { sensitivity: "base" }))
     .map(([category, commands]) => {
       const emoji = CATEGORY_EMOJI[category] || "📂";
-      const heading = `╭─〔 ${emoji} ${category} · ${commands.length} commande${commands.length === 1 ? "" : "s"} 〕`;
-      const blocks = commands
+      const names = commands
         .sort((a, b) => a.name.localeCompare(b.name, "fr", { sensitivity: "base" }))
-        .map(command => {
-          const shownAliases = command.aliases.slice(0, MAX_VISIBLE_ALIASES);
-          const extraAliases = command.aliases.length - shownAliases.length;
-          const aliasLabel = shownAliases.length
-            ? `│     ↳ Alias : ${shownAliases.map(alias => `${prefix}${alias}`).join(", ")}${extraAliases > 0 ? ` +${extraAliases}` : ""}`
-            : "";
-          return [
-            `│  ✦ ${prefix}${command.name}`,
-            `│     ${command.description}`,
-            ...(aliasLabel ? [aliasLabel] : [])
-          ];
-        });
-      return { heading, blocks };
+        .map(command => command.name);
+      return { category, emoji, count: names.length, names };
     });
 }
 
 function buildMenuPages(commands, prefix = "!", maxBytes = MAX_MESSAGE_BYTES) {
   const safePrefix = cleanText(prefix, "!");
   const entries = getCommandEntries(commands);
-  const sections = makeSections(entries, safePrefix);
-  const contentBudget = Math.max(350, Number(maxBytes) - PAGE_CONTENT_RESERVE_BYTES);
-  const contentPages = [];
-  let current = [];
+  const sections = makeSections(entries);
+  const categoryCount = sections.length;
+  const header = [
+    "╭━━━〔 ✨ MENU DES COMMANDES 〕━━━╮",
+    `│ Préfixe : ${safePrefix}  •  ${entries.length} commandes  •  ${categoryCount} catégories`,
+    "├──────────────────────────────────"
+  ];
+  const footer = [
+    "├──────────────────────────────────",
+    `│ 💡 Ajoute ${safePrefix} devant le nom d’une commande.`,
+    "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
+  ];
 
-  const fits = lines => byteLength(lines.join("\n")) <= contentBudget;
-  const flush = () => {
-    if (current.length) contentPages.push(current);
-    current = [];
+  const render = (showPrefix, compact) => {
+    const lines = sections.map(section => {
+      const label = compact
+        ? `${section.emoji} ${section.category}`
+        : `${section.emoji} ${section.category} (${section.count})`;
+      const names = section.names.map(name => showPrefix ? `${safePrefix}${name}` : name);
+      const separator = compact ? ", " : " · ";
+      return `│ ${label} : ${names.join(separator)}`;
+    });
+    if (!sections.length) lines.push("│ 📭 Aucune commande n’est actuellement chargée.");
+    return [...header, ...lines, ...footer].join("\n");
   };
 
-  for (const section of sections) {
-    if (current.length && !fits([...current, section.heading, ...(section.blocks[0] || [])])) flush();
-    current.push(section.heading);
-
-    for (let index = 0; index < section.blocks.length; index++) {
-      const block = section.blocks[index];
-      if (current.length && !fits([...current, ...block])) {
-        flush();
-        current.push(`${section.heading} · suite`);
-      }
-      current.push(...block);
-    }
+  // Une seule page : si la liste est longue, on retire d’abord le préfixe répété
+  // et les compteurs de catégorie; le préfixe reste clairement indiqué en haut.
+  let page = render(true, false);
+  if (byteLength(page) > maxBytes) page = render(false, false);
+  if (byteLength(page) > maxBytes) page = render(false, true);
+  if (byteLength(page) > maxBytes) {
+    throw new Error(`Toutes les commandes ne tiennent pas sur une seule page de ${maxBytes} octets.`);
   }
-
-  flush();
-  if (!contentPages.length) contentPages.push(["│  📭 Aucune commande n’est actuellement chargée."]);
-
-  const totalPages = contentPages.length;
-  const categoryCount = sections.length;
-  return contentPages.map((lines, index) => {
-    const header = [
-      "╭━━━〔 ✨ MENU DES COMMANDES 〕━━━╮",
-      `│ Préfixe : ${safePrefix}  •  ${entries.length} commande${entries.length === 1 ? "" : "s"}  •  ${categoryCount} catégorie${categoryCount === 1 ? "" : "s"}`,
-      `│ Page ${index + 1}/${totalPages}`,
-      "├──────────────────────────────────"
-    ];
-    const footer = [
-      "├──────────────────────────────────",
-      `│ 💡 Tape une commande avec le préfixe ${safePrefix}.`,
-      "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
-    ];
-    const page = [...header, ...lines, ...footer].join("\n");
-    if (byteLength(page) > maxBytes) {
-      throw new Error(`Une page du menu dépasse la limite de ${maxBytes} octets.`);
-    }
-    return page;
-  });
+  return [page];
 }
 
 async function sendMenu(context, dependencies = {}) {
@@ -226,9 +200,9 @@ async function sendMenu(context, dependencies = {}) {
 module.exports = {
   config: {
     name: "menu",
-    version: "6.0.0",
+    version: "6.1.0",
     author: "Diwate",
-    description: "Affiche les commandes classées par catégorie",
+    description: "Affiche toutes les commandes par catégorie sur une page puis envoie la vidéo",
     category: "Menu",
     usages: "menu",
     role: 0
@@ -237,6 +211,7 @@ module.exports = {
   getCommandEntries,
   sendMenu,
   MAX_MESSAGE_BYTES,
+  VIDEO_URL,
   VIDEO_PATH,
 
   onStart: async function (context) {
