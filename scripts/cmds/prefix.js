@@ -26,10 +26,6 @@ function formatPrefixMessage(prefix) {
   return `✨ Le préfixe actuel est : ${currentPrefix}\n🌸 Exemple : ${currentPrefix}menu`;
 }
 
-function isBarePrefixRequest(event) {
-  return String(event && event.body || "").trim().toLocaleLowerCase("fr-FR") === "prefix";
-}
-
 async function replyWithPrefix(context = {}) {
   const prefix = getCurrentPrefix(context);
   return send(
@@ -43,28 +39,16 @@ module.exports = {
     name: "prefix",
     version: "1.0.0",
     author: "Diwate",
-    description: "Affiche le préfixe actuellement utilisé dans cette conversation",
+    description: "Affiche le préfixe actuel avec ou sans préfixe de commande",
     category: "Général",
     usages: "prefix",
+    prefix: false,
     role: 0
   },
   getCurrentPrefix,
   formatPrefixMessage,
-  isBarePrefixRequest,
   normalizePrefix,
   replyWithPrefix,
-
-  // Autorise l’utilisateur qui ignore le préfixe à envoyer simplement « prefix ».
-  onChat: async function (context = {}) {
-    if (!isBarePrefixRequest(context.event)) return false;
-    try {
-      await replyWithPrefix(context);
-      return true;
-    } catch (error) {
-      console.error("[Commande prefix] Impossible d’envoyer le préfixe :", error.stack || error);
-      return false;
-    }
-  },
 
   onStart: async function (context = {}) {
     return replyWithPrefix(context);
