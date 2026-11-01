@@ -18,11 +18,11 @@ function getCurrentPrefix(context = {}) {
   const configuredPrefix = normalizePrefix(
     global.GoatBot && global.GoatBot.config && global.GoatBot.config.prefix
   );
-  return configuredPrefix || "~";
+  return configuredPrefix || "!";
 }
 
 function formatPrefixMessage(prefix) {
-  const currentPrefix = normalizePrefix(prefix) || "~";
+  const currentPrefix = normalizePrefix(prefix) || "!";
   return `✨ Le préfixe actuel est : ${currentPrefix}\n🌸 Exemple : ${currentPrefix}menu`;
 }
 
