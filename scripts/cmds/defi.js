@@ -231,7 +231,7 @@ function rulesText(prefix = "!") {
     `🎭 Après acceptation, chacun choisit son personnage : ${prefix}defi personnages puis ${prefix}defi choisir Naruto. Le combat commence après les deux choix.`,
     "",
     `⚔️ Défier : ${prefix}defi @mention | ✅ Accepter : ${prefix}defi accepter | 🚫 Refuser : ${prefix}defi refuser`,
-    `🎮 Actions : ${prefix}defi attaquer / jutsu / ultime / charger / defendre / esquiver / soin / statut / abandonner`,
+    `🎮 Actions : ${prefix}attaquer / jutsu / ultime / charger / defendre / esquiver / soin / statut / abandonner`,
     "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
   ].join("\n");
 }
@@ -260,7 +260,7 @@ function playerIndex(game, id) {
 }
 
 function combatCommandsText(prefix = "!") {
-  return `🎮 COMMANDES : ${prefix}defi attaquer | ${prefix}defi jutsu | ${prefix}defi ultime | ${prefix}defi charger | ${prefix}defi defendre | ${prefix}defi esquiver | ${prefix}defi soin | ${prefix}defi statut | ${prefix}defi abandonner`;
+  return `🎮 COMMANDES : ${prefix}attaque | ${prefix}jutsu | ${prefix}ultime | ${prefix}charge | ${prefix}defend | ${prefix}esquive | ${prefix}soin | ${prefix}statut | ${prefix}abandonner`;
 }
 
 function statusMessage(game, prefix = "!") {
@@ -331,12 +331,12 @@ async function resolveDisplayName(context, userID, preferredName, fallback = "Ni
 
 function fighterListText(prefix = "!") {
   const roster = FIGHTERS.map((fighter, index) => `${index + 1}. ${fighter.name} · puissance +${fighter.power}\n   ✨ ${fighter.jutsu} | 🌪️ ${fighter.ultimate}`).join("\n");
-  return `╭━━━〔 🎴 CHOISIS TON PERSONNAGE 〕━━━╮\n${roster}\n╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\nTape ${prefix}defi choisir <nom> — exemple : ${prefix}defi choisir Naruto.`;
+  return `╭━━━〔 🎴 CHOISIS TON PERSONNAGE 〕━━━╮\n${roster}\n╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\nTape ${prefix}choisit <nom> — exemple : ${prefix}choisit Naruto.`;
 }
 
 function selectionStatus(game, prefix = "!") {
   const players = game.players.map(player => `🥷 ${player.name} — ${player.fighter ? `✅ ${player.fighter}` : "⏳ personnage à choisir"}`).join("\n");
-  return `🎭 SÉLECTION DES PERSONNAGES\n${players}\n\n📜 Liste : ${prefix}defi personnages\n🎴 Choisir : ${prefix}defi choisir <nom> (exemple : ${prefix}defi choisir Naruto).\nLe combat commence après le choix des deux joueurs.`;
+  return `🎭 SÉLECTION DES PERSONNAGES\n${players}\n\n📜 Liste : ${prefix}personnages\n🎴 Choisir : ${prefix}choisit <nom> (exemple : ${prefix}choisit Naruto).\nLe combat commence après le choix des deux joueurs.`;
 }
 
 function challengeMessage(challengerName, opponentName, prefix) {
