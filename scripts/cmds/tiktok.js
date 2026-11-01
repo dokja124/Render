@@ -71,41 +71,78 @@ function isMp4(buffer) {
 }
 
 // ───────────────────────── API TikWM ─────────────────────────
-async function callApi(deps, endpoint, fields) {
-  let lastError;
-  for (const host of deps.hosts) {
-    for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt++) {
-      try {
-        const response = await deps.axios.post(`${host}${endpoint}`, new URLSearchParams(fields).toString(), {
-          headers: {
-            "User-Agent": USER_AGENT,
-            "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
-            Accept: "application/json, text/javascript, */*; q=0.01",
-            Origin: host,
-            Referer: `${host}/`
-          },
-          timeout: 25000,
-          maxContentLength: 4 * 1024 * 1024
-        });
-        const body = response && response.data;
-        if (!body || typeof body !== "object") throw new Error("Réponse TikTok illisible.");
-        if (body.code === 0) return { host, data: body.data };
+function browserHeaders(host, extra = {}) {
+  return {
+    "User-Agent": USER_AGENT,
+    Accept: "application/json, text/javascript, */*; q=0.01",
+    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
+    "sec-ch-ua": "\"Chromium\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": "\"Windows\"",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+    "X-Requested-With": "XMLHttpRequest",
+    Origin: host,
+    Referer: `${host}/`,
+    ...extra
+  };
+}
 
-        const message = String(body.msg || "erreur API");
-        if (/limit|too many|second/i.test(message) && attempt < RATE_LIMIT_RETRIES) {
-          await deps.sleep(RATE_LIMIT_WAIT_MS);
-          continue;
+function hostLabel(host) {
+  try { return new URL(host).hostname; } catch (_) { return String(host); }
+}
+
+async function callApi(deps, endpoint, fields) {
+  const attempts = [];
+  const form = new URLSearchParams(fields).toString();
+  for (const host of deps.hosts) {
+    // POST d'abord, puis GET : certains pare-feux bloquent l'un et pas l'autre.
+    for (const method of ["POST", "GET"]) {
+      const label = `${hostLabel(host)} ${method}`;
+      for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt++) {
+        try {
+          const response = method === "POST"
+            ? await deps.axios.post(`${host}${endpoint}`, form, {
+              headers: browserHeaders(host, { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }),
+              timeout: 25000,
+              maxContentLength: 4 * 1024 * 1024
+            })
+            : await deps.axios.get(`${host}${endpoint}?${form}`, {
+              headers: browserHeaders(host),
+              timeout: 25000,
+              maxContentLength: 4 * 1024 * 1024
+            });
+          const body = response && response.data;
+          if (!body || typeof body !== "object") {
+            attempts.push(`${label} → réponse illisible (page de protection ?)`);
+            break;
+          }
+          if (body.code === 0) return { host, data: body.data };
+
+          const message = String(body.msg || "erreur API");
+          if (/limit|too many|second/i.test(message) && attempt < RATE_LIMIT_RETRIES) {
+            await deps.sleep(RATE_LIMIT_WAIT_MS);
+            continue;
+          }
+          attempts.push(`${label} → ${message.slice(0, 80)}`);
+          break;
+        } catch (error) {
+          const status = error && error.response && error.response.status;
+          if (status === 429 && attempt < RATE_LIMIT_RETRIES) {
+            await deps.sleep(RATE_LIMIT_WAIT_MS);
+            continue;
+          }
+          attempts.push(`${label} → ${status ? `HTTP ${status}` : errorText(error)}`);
+          break;
         }
-        const error = new Error(message);
-        error.apiMessage = message;
-        throw error;
-      } catch (error) {
-        lastError = error;
-        break; // erreur API ou réseau : on passe au domaine suivant
       }
     }
   }
-  throw lastError || new Error("API TikTok injoignable.");
+  const error = new Error(`API TikTok injoignable (${attempts.join(" | ")})`);
+  error.attempts = attempts;
+  error.blocked = attempts.length > 0 && attempts.every(line => /HTTP 403/.test(line));
+  throw error;
 }
 
 function normalizeVideo(raw, host) {
@@ -149,26 +186,35 @@ async function resolveVideoUrl(url, deps = defaultDeps) {
 
 // ───────────────────────── Téléchargement ─────────────────────────
 async function downloadVideo(video, deps = defaultDeps) {
-  let lastError;
+  const referers = ["https://www.tikwm.com/", "https://www.tiktok.com/", null];
+  const failures = [];
   for (const url of video.urls) {
-    try {
-      const response = await deps.axios.get(url, {
-        responseType: "arraybuffer",
-        timeout: 60000,
-        maxContentLength: deps.maxVideoBytes,
-        maxBodyLength: deps.maxVideoBytes,
-        maxRedirects: 5,
-        headers: { "User-Agent": USER_AGENT, Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8", Referer: "https://www.tikwm.com/" }
-      });
-      const buffer = Buffer.from(response.data);
-      if (buffer.length > deps.maxVideoBytes) throw new Error("Vidéo trop lourde pour Messenger.");
-      if (!isMp4(buffer)) throw new Error("Le fichier reçu n'est pas un MP4 valide.");
-      return buffer;
-    } catch (error) {
-      lastError = error;
+    for (const referer of referers) {
+      try {
+        const headers = { "User-Agent": USER_AGENT, Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9" };
+        if (referer) headers.Referer = referer;
+        const response = await deps.axios.get(url, {
+          responseType: "arraybuffer",
+          timeout: 60000,
+          maxContentLength: deps.maxVideoBytes,
+          maxBodyLength: deps.maxVideoBytes,
+          maxRedirects: 5,
+          headers
+        });
+        const buffer = Buffer.from(response.data);
+        if (buffer.length > deps.maxVideoBytes) throw new Error("Vidéo trop lourde pour Messenger.");
+        if (!isMp4(buffer)) throw new Error("Le fichier reçu n'est pas un MP4 valide.");
+        return buffer;
+      } catch (error) {
+        const status = error && error.response && error.response.status;
+        failures.push(`${hostLabel(url)} → ${status ? `HTTP ${status}` : errorText(error)}`);
+        if (status !== 403 && status !== 401) break; // seul un refus d'accès justifie d'essayer un autre Referer
+      }
     }
   }
-  throw lastError || new Error("Aucune URL de téléchargement utilisable.");
+  const error = new Error(`Téléchargement impossible (${[...new Set(failures)].slice(0, 3).join(" | ")})`);
+  error.blocked = failures.length > 0 && failures.every(line => /HTTP 40[13]/.test(line));
+  throw error;
 }
 
 function isCandidateAllowed(video, deps) {
@@ -189,6 +235,9 @@ function buildCaption(video, query, isLink) {
 
 function explainError(error, stage) {
   const status = error && error.response && error.response.status;
+  if (error && error.blocked) {
+    return `❌ Accès refusé (HTTP 403) pendant « ${stage} » : le service TikTok bloque l'adresse IP du serveur du bot.\n🔧 ${String(error.message).slice(0, 220)}`;
+  }
   if (status === 429 || /limit|too many/i.test(String(error && error.message))) {
     return "❌ Le service TikTok est saturé. Réessaie dans quelques secondes.";
   }
@@ -196,7 +245,7 @@ function explainError(error, stage) {
   if (error && (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT")) {
     return `❌ Délai dépassé pendant l'étape « ${stage} ». Réessaie.`;
   }
-  return `❌ Échec de l'étape « ${stage} » : ${errorText(error)}`;
+  return `❌ Échec de l'étape « ${stage} » : ${String(error && error.message || "erreur inconnue").replace(/\s+/g, " ").slice(0, 260)}`;
 }
 
 // ───────────────────────── Commande ─────────────────────────
@@ -244,6 +293,7 @@ async function run({ api, message, event, args, prefix }, deps = defaultDeps) {
     let chosen = null;
     let buffer = null;
     let lastError = null;
+    let blockedCount = 0;
     for (const video of eligible) {
       try {
         buffer = await downloadVideo(video, deps);
@@ -252,6 +302,8 @@ async function run({ api, message, event, args, prefix }, deps = defaultDeps) {
       } catch (error) {
         lastError = error;
         console.warn(`[Commande tiktok] Vidéo ${video.id || "?"} ignorée : ${errorText(error)}`);
+        // Deux refus d'accès d'affilée = l'IP est bloquée, inutile d'insister.
+        if (error && error.blocked && ++blockedCount >= 2) break;
       }
     }
     if (!chosen) throw lastError || new Error("Aucune vidéo téléchargeable.");

@@ -51,7 +51,11 @@ function randomInt(min, max) {
 function findFighter(value) {
   const target = normalize(value);
   if (!target) return null;
-  return FIGHTERS.find(fighter => normalize(fighter.name) === target || (fighter.aliases || []).some(alias => normalize(alias) === target)) || null;
+  const compactTarget = target.replace(/\s+/g, "");
+  return FIGHTERS.find(fighter =>
+    normalize(fighter.name) === target || normalize(fighter.name).replace(/\s+/g, "") === compactTarget ||
+    (fighter.aliases || []).some(alias => normalize(alias) === target || normalize(alias).replace(/\s+/g, "") === compactTarget)
+  ) || null;
 }
 
 function pickFighter(excludeName) {
@@ -228,10 +232,11 @@ function rulesText(prefix = "!") {
     `🩹 Soin : une seule fois par combat, coûte 60 chakra et rend jusqu’à 80 PV (maximum ${MAX_HP}).`,
     "🏆 Victoire : faire tomber les PV adverses à 0, ou gagner si l’adversaire abandonne.",
     "🚫 Une action refusée (pas assez de chakra, mauvaise commande, mauvais tour) ne consomme rien.",
-    `🎭 Après acceptation, chacun choisit son personnage : ${prefix}defi personnages puis ${prefix}defi choisir Naruto. Le combat commence après les deux choix.`,
+    `🎭 Après acceptation, chacun choisit son personnage : ${prefix}naruto, ${prefix}sasuke, ${prefix}itachi… ou ${prefix}defi choisir <nom>. Le combat commence après les deux choix.`,
     "",
-    `⚔️ Défier : ${prefix}defi @mention | ✅ Accepter : ${prefix}defi accepter | 🚫 Refuser : ${prefix}defi refuser`,
-    `🎮 Actions : ${prefix}attaquer / jutsu / ultime / charger / defendre / esquiver / soin / statut / abandonner`,
+    `⚔️ Défier : ${prefix}defi @mention | ✅ Accepter : ${prefix}defi accepté | 🚫 Refuser : ${prefix}defi refusé`,
+    `🎮 Actions directes : ${prefix}attaquer / ${prefix}jutsu / ${prefix}ultime / ${prefix}charger / ${prefix}defendre / ${prefix}esquiver / ${prefix}soin / ${prefix}statut`,
+    `🏳️ Abandonner : ${prefix}defi abandonner`,
     "╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯"
   ].join("\n");
 }
@@ -260,7 +265,7 @@ function playerIndex(game, id) {
 }
 
 function combatCommandsText(prefix = "!") {
-  return `🎮 COMMANDES : ${prefix}attaque | ${prefix}jutsu | ${prefix}ultime | ${prefix}charge | ${prefix}defend | ${prefix}esquive | ${prefix}soin | ${prefix}statut | ${prefix}abandonner`;
+  return `🎮 ACTIONS : ${prefix}attaquer | ${prefix}jutsu | ${prefix}ultime | ${prefix}charger | ${prefix}defendre | ${prefix}esquiver | ${prefix}soin | ${prefix}statut | ${prefix}defi abandonner`;
 }
 
 function statusMessage(game, prefix = "!") {
@@ -331,12 +336,12 @@ async function resolveDisplayName(context, userID, preferredName, fallback = "Ni
 
 function fighterListText(prefix = "!") {
   const roster = FIGHTERS.map((fighter, index) => `${index + 1}. ${fighter.name} · puissance +${fighter.power}\n   ✨ ${fighter.jutsu} | 🌪️ ${fighter.ultimate}`).join("\n");
-  return `╭━━━〔 🎴 CHOISIS TON PERSONNAGE 〕━━━╮\n${roster}\n╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\nTape ${prefix}choisit <nom> — exemple : ${prefix}choisit Naruto.`;
+  return `╭━━━〔 🎴 CHOISIS TON PERSONNAGE 〕━━━╮\n${roster}\n╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯\n\nTape directement ${prefix}naruto, ${prefix}sasuke, ${prefix}itachi… ou utilise ${prefix}defi choisir <nom>.`;
 }
 
 function selectionStatus(game, prefix = "!") {
   const players = game.players.map(player => `🥷 ${player.name} — ${player.fighter ? `✅ ${player.fighter}` : "⏳ personnage à choisir"}`).join("\n");
-  return `🎭 SÉLECTION DES PERSONNAGES\n${players}\n\n📜 Liste : ${prefix}personnages\n🎴 Choisir : ${prefix}choisit <nom> (exemple : ${prefix}choisit Naruto).\nLe combat commence après le choix des deux joueurs.`;
+  return `🎭 SÉLECTION DES PERSONNAGES\n${players}\n\n📜 Liste : ${prefix}defi personnages\n🎴 Choisir directement : ${prefix}naruto, ${prefix}sasuke, ${prefix}itachi… (ou ${prefix}defi choisir <nom>).\nLe combat commence après le choix des deux joueurs.`;
 }
 
 function challengeMessage(challengerName, opponentName, prefix) {
@@ -350,12 +355,19 @@ function openChallengeMessage(challengerName, prefix) {
 module.exports = {
   config: {
     name: "defi",
-    aliases: ["défi"],
-    version: "6.2.0",
+    version: "6.3.0",
     author: "Diwate",
     description: "Combat ninja avec pseudos, personnages sélectionnables et statistiques renforcées",
     category: "Divertissement",
-    usages: "defi [@mention | accepter | personnages | choisir <nom> | action]",
+    usages: "defi [@mention | accepter | refusé | personnages | abandonner] ; actions directes : jutsu, ultime, attaquer…",
+    aliases: Array.from(new Set([
+      "défi",
+      ...COMBAT_ACTIONS.filter(action => action !== "abandonner"),
+      ...FIGHTERS.flatMap(fighter => [
+        normalize(fighter.name).replace(/\s+/g, ""),
+        ...(fighter.aliases || []).map(alias => normalize(alias).replace(/\s+/g, ""))
+      ])
+    ])).filter(alias => alias && alias !== "defi" && alias !== "défi"),
     role: 0
   },
   STORAGE_KEY,
@@ -382,7 +394,7 @@ module.exports = {
   selectionStatus,
   resolveDisplayName,
 
-  onStart: async function ({ api, message, event, args, prefix, globalData, usersData }) {
+  onStart: async function ({ api, message, event, args, prefix, globalData, usersData, commandName }) {
     const previous = commandQueue.catch(() => {});
     let release;
     commandQueue = new Promise(resolve => { release = resolve; });
@@ -393,7 +405,18 @@ module.exports = {
       if (!threadID || !userID) return send({ api, message, event }, "❌ Conversation ou joueur impossible à identifier.");
       const commandPrefix = prefix || "!";
       const words = Array.isArray(args) ? args : [];
-      const action = normalize(words[0] || "");
+      // event.body conserve le nom réellement tapé, même si GoatBot remplace
+      // ensuite un alias par le nom canonique de la commande.
+      const bodyToken = String(event && event.body || "").trim().split(/\s+/)[0] || "";
+      const bodyCommand = bodyToken.startsWith(commandPrefix)
+        ? bodyToken.slice(commandPrefix.length)
+        : bodyToken.replace(/^[^A-Za-z0-9À-ÿ]+/, "");
+      const invokedCommand = normalize(bodyCommand || commandName || "defi");
+      const directFighter = findFighter(invokedCommand);
+      const directAction = COMBAT_ACTIONS.includes(invokedCommand) && invokedCommand !== "abandonner"
+        ? invokedCommand
+        : "";
+      const action = directAction || normalize(words[0] || "");
       const mention = firstMention(event);
       const context = { api, usersData };
       const games = await getGames(globalData);
@@ -462,7 +485,7 @@ module.exports = {
         return send({ api, message, event }, "🚫 Le défi a été refusé/annulé.");
       }
 
-      if (action === "" && !mention) {
+      if (action === "" && !mention && !directFighter) {
         if (game && game.status === "pending") {
           const pendingText = game.players[1].id === "*"
             ? `⏳ Défi ouvert de ${game.players[0].name} en attente. Un autre membre peut écrire ${commandPrefix}defi accepter ou ${commandPrefix}defi accepté.`
@@ -490,7 +513,7 @@ module.exports = {
       }
 
       const isFighterRequest = Boolean(findFighter(words.join(" ")));
-      if (mention && !COMBAT_ACTIONS.includes(action) && !LIST_ACTIONS.includes(action) && !PICK_ACTIONS.includes(action) && !isFighterRequest) {
+      if (mention && !COMBAT_ACTIONS.includes(action) && !LIST_ACTIONS.includes(action) && !PICK_ACTIONS.includes(action) && !directFighter && !isFighterRequest) {
         if (mention.id === userID) return send({ api, message, event }, "😅 Tu ne peux pas te défier toi-même.");
         if (game && ["pending", "selecting", "active"].includes(game.status)) return send({ api, message, event }, "⚔️ Un défi ou un combat est déjà en cours dans cette conversation.");
         const challengerName = await resolveDisplayName(context, userID, event.senderName, "Ninja défieur");
@@ -516,14 +539,16 @@ module.exports = {
       if (game.status === "selecting") {
         const currentIndex = playerIndex(game, userID);
         if (currentIndex === -1) return send({ api, message, event }, "⛔ Tu ne participes pas à la sélection des personnages.");
-        if (action === "statut" || action === "") {
+        if (action === "statut" || (action === "" && !directFighter)) {
           await send({ api, message, event }, selectionStatus(game, commandPrefix));
           return send({ api, message, event }, fighterListText(commandPrefix));
         }
 
-        const requestedName = PICK_ACTIONS.includes(action)
-          ? words.slice(1).join(" ").trim()
-          : words.join(" ").trim();
+        const requestedName = directFighter
+          ? directFighter.name
+          : PICK_ACTIONS.includes(action)
+            ? words.slice(1).join(" ").trim()
+            : words.join(" ").trim();
         const selectedFighter = findFighter(requestedName);
         if (!selectedFighter) {
           const hint = requestedName ? `❓ Personnage inconnu : « ${requestedName} ».` : "❓ Indique le nom du personnage à choisir.";
