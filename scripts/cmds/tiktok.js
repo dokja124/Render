@@ -6,360 +6,327 @@ const os = require("os");
 const path = require("path");
 const { send } = require("./lib/messenger");
 
-// ───────────────────────── Réglages ─────────────────────────
-const API_HOSTS = ["https://www.tikwm.com", "https://tikwm.com"];
-const USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
-const MAX_VIDEO_BYTES = 25 * 1024 * 1024; // limite d'upload Messenger
-const MAX_DURATION_SEC = 10 * 60; // on ignore les vidéos de plus de 10 min
-const MAX_CANDIDATES = 8; // nombre de vidéos essayées avant d'abandonner
-const MAX_QUERY_CHARS = 100;
-const SEARCH_COUNT = 15;
-const COOLDOWN_MS = 15 * 1000;
-const RATE_LIMIT_RETRIES = 3;
-const RATE_LIMIT_WAIT_MS = 1200;
+const TIKWM_ORIGIN = "https://www.tikwm.com";
+const SEARCH_URL = `${TIKWM_ORIGIN}/api/feed/search`;
+const USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36";
+const MAX_QUERY_CHARS = 120;
+const SEARCH_RESULT_COUNT = 8;
+const MAX_DOWNLOAD_ATTEMPTS = 3;
+const MAX_VIDEO_BYTES = 22 * 1024 * 1024;
+const MAX_VIDEO_DURATION_SECONDS = 600;
+const MAX_CONCURRENT_REQUESTS = 3;
+const REQUEST_TIMEOUT_MS = 25000;
+const activeRequests = new Set();
 
-const cooldowns = new Map(); // senderID -> timestamp de fin de cooldown
-const running = new Set(); // senderID avec une recherche en cours
-
-// ───────────────────────── Utilitaires ─────────────────────────
-const defaultDeps = {
-  axios,
-  fs,
-  hosts: API_HOSTS,
-  maxVideoBytes: MAX_VIDEO_BYTES,
-  sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),
-  now: () => Date.now()
-};
-
-function cleanQuery(args) {
-  const raw = Array.isArray(args) ? args.join(" ") : "";
-  return raw.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, MAX_QUERY_CHARS);
+function cleanText(value, maxChars = 300) {
+  if (value == null) return "";
+  return Array.from(String(value).replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim())
+    .slice(0, maxChars)
+    .join("");
 }
 
-function isTikTokUrl(text) {
-  return /^https?:\/\/(?:[a-z0-9-]+\.)?tiktok\.com\/\S+/i.test(String(text || "").trim());
+function getPrefixes(context = {}) {
+  const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
+  const candidates = [context.prefix, config.prefix];
+  const prefixes = [];
+  for (const candidate of candidates) {
+    const values = Array.isArray(candidate) ? candidate : [candidate];
+    for (const value of values) {
+      const prefix = String(value || "").trim();
+      if (prefix && !prefixes.includes(prefix)) prefixes.push(prefix);
+    }
+  }
+  if (!prefixes.length) prefixes.push("!");
+  return prefixes.sort((a, b) => b.length - a.length);
 }
 
-function errorText(error) {
-  const message = error && (error.message || error.code) || "erreur inconnue";
-  return String(message).replace(/\s+/g, " ").slice(0, 160);
+function getQuery(context = {}) {
+  const normalize = value => String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  const argsQuery = Array.isArray(context.args)
+    ? normalize(context.args.join(" "))
+    : normalize(context.args);
+  if (argsQuery) return argsQuery;
+
+  const body = String((context.event && (context.event.body || context.event.message)) || "").trim();
+  const firstToken = body.split(/\s+/)[0] || "";
+  for (const prefix of getPrefixes(context)) {
+    if (!firstToken.startsWith(prefix)) continue;
+    const withoutPrefix = body.slice(prefix.length).trim();
+    const match = withoutPrefix.match(/^tiktok(?:\s+|$)([\s\S]*)$/i);
+    return match ? normalize(match[1]) : "";
+  }
+  return "";
 }
 
-function getUserID(event) {
-  return String(event && (event.senderID || event.userID || event.author) || "");
-}
-
-function formatDuration(seconds) {
-  const total = Math.max(0, Math.round(Number(seconds) || 0));
-  if (!total) return "";
-  const m = Math.floor(total / 60);
-  const s = String(total % 60).padStart(2, "0");
-  return `${m}:${s}`;
-}
-
-function toAbsoluteUrl(value, host) {
-  if (typeof value !== "string" || !value.trim()) return null;
-  const url = value.trim();
-  if (/^https?:\/\//i.test(url)) return url;
-  if (url.startsWith("//")) return `https:${url}`;
-  if (url.startsWith("/")) return `${host}${url}`;
-  return null;
+function makeError(code, message) {
+  const error = new Error(message);
+  error.code = code;
+  return error;
 }
 
 function isMp4(buffer) {
-  return Buffer.isBuffer(buffer) && buffer.length > 1024 && buffer.toString("ascii", 4, 8) === "ftyp";
+  return Buffer.isBuffer(buffer) && buffer.length >= 12 && buffer.toString("ascii", 4, 8) === "ftyp";
 }
 
-// ───────────────────────── API TikWM ─────────────────────────
-function browserHeaders(host, extra = {}) {
-  return {
-    "User-Agent": USER_AGENT,
-    Accept: "application/json, text/javascript, */*; q=0.01",
-    "Accept-Language": "en-US,en;q=0.9,fr;q=0.8",
-    "sec-ch-ua": "\"Chromium\";v=\"130\", \"Not?A_Brand\";v=\"99\"",
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": "\"Windows\"",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
-    "Sec-Fetch-Site": "same-origin",
-    "X-Requested-With": "XMLHttpRequest",
-    Origin: host,
-    Referer: `${host}/`,
-    ...extra
-  };
-}
-
-function hostLabel(host) {
-  try { return new URL(host).hostname; } catch (_) { return String(host); }
-}
-
-async function callApi(deps, endpoint, fields) {
-  const attempts = [];
-  const form = new URLSearchParams(fields).toString();
-  for (const host of deps.hosts) {
-    // POST d'abord, puis GET : certains pare-feux bloquent l'un et pas l'autre.
-    for (const method of ["POST", "GET"]) {
-      const label = `${hostLabel(host)} ${method}`;
-      for (let attempt = 0; attempt <= RATE_LIMIT_RETRIES; attempt++) {
-        try {
-          const response = method === "POST"
-            ? await deps.axios.post(`${host}${endpoint}`, form, {
-              headers: browserHeaders(host, { "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8" }),
-              timeout: 25000,
-              maxContentLength: 4 * 1024 * 1024
-            })
-            : await deps.axios.get(`${host}${endpoint}?${form}`, {
-              headers: browserHeaders(host),
-              timeout: 25000,
-              maxContentLength: 4 * 1024 * 1024
-            });
-          const body = response && response.data;
-          if (!body || typeof body !== "object") {
-            attempts.push(`${label} → réponse illisible (page de protection ?)`);
-            break;
-          }
-          if (body.code === 0) return { host, data: body.data };
-
-          const message = String(body.msg || "erreur API");
-          if (/limit|too many|second/i.test(message) && attempt < RATE_LIMIT_RETRIES) {
-            await deps.sleep(RATE_LIMIT_WAIT_MS);
-            continue;
-          }
-          attempts.push(`${label} → ${message.slice(0, 80)}`);
-          break;
-        } catch (error) {
-          const status = error && error.response && error.response.status;
-          if (status === 429 && attempt < RATE_LIMIT_RETRIES) {
-            await deps.sleep(RATE_LIMIT_WAIT_MS);
-            continue;
-          }
-          attempts.push(`${label} → ${status ? `HTTP ${status}` : errorText(error)}`);
-          break;
-        }
-      }
-    }
+function getVideoUrl(rawUrl) {
+  if (typeof rawUrl !== "string" || !rawUrl.trim()) {
+    throw makeError("VIDEO_URL_MISSING", "TikWM n’a pas fourni de lien vidéo.");
   }
-  const error = new Error(`API TikTok injoignable (${attempts.join(" | ")})`);
-  error.attempts = attempts;
-  error.blocked = attempts.length > 0 && attempts.every(line => /HTTP 403/.test(line));
-  throw error;
+
+  let url;
+  try {
+    url = new URL(rawUrl, TIKWM_ORIGIN);
+  } catch (_) {
+    throw makeError("VIDEO_URL_INVALID", "Le lien vidéo retourné est invalide.");
+  }
+
+  const host = url.hostname.toLowerCase();
+  if (url.protocol !== "https:" || !["www.tikwm.com", "tikwm.com"].includes(host) || url.username || url.password) {
+    throw makeError("VIDEO_URL_UNTRUSTED", "Le lien vidéo ne provient pas du domaine TikWM attendu.");
+  }
+  return url.toString();
 }
 
-function normalizeVideo(raw, host) {
-  if (!raw || typeof raw !== "object") return null;
-  const urls = [raw.play, raw.wmplay]
-    .map(value => toAbsoluteUrl(value, host))
-    .filter(Boolean);
-  const unique = [...new Set(urls)];
-  if (!unique.length) return null;
-
-  const author = raw.author && (raw.author.unique_id || raw.author.nickname) || "";
-  const id = String(raw.video_id || raw.id || "");
-  return {
-    id,
-    title: String(raw.title || "").replace(/\s+/g, " ").trim(),
-    author: String(author),
-    duration: Number(raw.duration) || 0,
-    size: Number(raw.size) || 0,
-    urls: unique,
-    pageUrl: author && id ? `https://www.tiktok.com/@${author}/video/${id}` : ""
-  };
+function getVideos(payload) {
+  const data = payload && payload.data;
+  if (data && Array.isArray(data.videos)) return data.videos;
+  if (payload && Array.isArray(payload.videos)) return payload.videos;
+  return [];
 }
 
-async function searchVideos(query, deps = defaultDeps) {
-  const { host, data } = await callApi(deps, "/api/feed/search", {
-    keywords: query,
-    count: String(SEARCH_COUNT),
-    cursor: "0",
-    web: "1",
-    hd: "1"
+async function searchTikTok(query, http = axios) {
+  const response = await http.get(SEARCH_URL, {
+    params: { keywords: query, count: SEARCH_RESULT_COUNT, cursor: 0, web: 1, hd: 1 },
+    timeout: REQUEST_TIMEOUT_MS,
+    maxContentLength: 2 * 1024 * 1024,
+    headers: {
+      Accept: "application/json, text/plain, */*",
+      "User-Agent": USER_AGENT,
+      Referer: `${TIKWM_ORIGIN}/`
+    }
   });
-  const videos = data && Array.isArray(data.videos) ? data.videos : [];
-  return videos.map(video => normalizeVideo(video, host)).filter(Boolean);
+
+  const payload = response && response.data;
+  if (!payload || Number(payload.code) !== 0) {
+    throw makeError("SEARCH_FAILED", cleanText(payload && payload.msg, 150) || "Le service TikWM a refusé la recherche.");
+  }
+  return getVideos(payload);
 }
 
-async function resolveVideoUrl(url, deps = defaultDeps) {
-  const { host, data } = await callApi(deps, "/api/", { url, hd: "1" });
-  const video = normalizeVideo(data, host);
-  return video ? [video] : [];
-}
-
-// ───────────────────────── Téléchargement ─────────────────────────
-async function downloadVideo(video, deps = defaultDeps) {
-  const referers = ["https://www.tikwm.com/", "https://www.tiktok.com/", null];
-  const failures = [];
-  for (const url of video.urls) {
-    for (const referer of referers) {
-      try {
-        const headers = { "User-Agent": USER_AGENT, Accept: "video/mp4,video/*;q=0.9,*/*;q=0.8", "Accept-Language": "en-US,en;q=0.9" };
-        if (referer) headers.Referer = referer;
-        const response = await deps.axios.get(url, {
-          responseType: "arraybuffer",
-          timeout: 60000,
-          maxContentLength: deps.maxVideoBytes,
-          maxBodyLength: deps.maxVideoBytes,
-          maxRedirects: 5,
-          headers
-        });
-        const buffer = Buffer.from(response.data);
-        if (buffer.length > deps.maxVideoBytes) throw new Error("Vidéo trop lourde pour Messenger.");
-        if (!isMp4(buffer)) throw new Error("Le fichier reçu n'est pas un MP4 valide.");
-        return buffer;
-      } catch (error) {
-        const status = error && error.response && error.response.status;
-        failures.push(`${hostLabel(url)} → ${status ? `HTTP ${status}` : errorText(error)}`);
-        if (status !== 403 && status !== 401) break; // seul un refus d'accès justifie d'essayer un autre Referer
-      }
+function getCandidateUrl(video) {
+  if (!video || typeof video !== "object") return "";
+  const sources = [video.play, video.wmplay].filter(value => typeof value === "string" && value.trim());
+  if (!sources.length) throw makeError("VIDEO_URL_MISSING", "TikWM n’a pas fourni de lien vidéo.");
+  let lastError;
+  for (const source of sources) {
+    try {
+      return getVideoUrl(source);
+    } catch (error) {
+      lastError = error;
     }
   }
-  const error = new Error(`Téléchargement impossible (${[...new Set(failures)].slice(0, 3).join(" | ")})`);
-  error.blocked = failures.length > 0 && failures.every(line => /HTTP 40[13]/.test(line));
-  throw error;
+  throw lastError || makeError("VIDEO_URL_INVALID", "Aucun lien vidéo TikWM valide n’a été fourni.");
 }
 
-function isCandidateAllowed(video, deps) {
-  if (video.size && video.size > deps.maxVideoBytes) return false;
-  if (video.duration && video.duration > MAX_DURATION_SEC) return false;
-  return true;
+function isCandidate(video) {
+  if (!video || typeof video !== "object" || video.is_ad === true) return false;
+  const duration = Number(video.duration);
+  if (Number.isFinite(duration) && duration > MAX_VIDEO_DURATION_SECONDS) return false;
+  const declaredSize = Number(video.size);
+  if (Number.isFinite(declaredSize) && declaredSize > 0 && declaredSize > MAX_VIDEO_BYTES) return false;
+  try {
+    return Boolean(getCandidateUrl(video));
+  } catch (_) {
+    return false;
+  }
 }
 
-function buildCaption(video, query, isLink) {
-  const lines = [isLink ? "🎵 TikTok" : `🎵 TikTok · « ${query} »`];
-  if (video.title) lines.push(`📝 ${video.title.slice(0, 180)}`);
-  if (video.author) lines.push(`👤 @${video.author}`);
-  const duration = formatDuration(video.duration);
-  if (duration) lines.push(`⏱️ ${duration}`);
-  if (video.pageUrl) lines.push(`🔗 ${video.pageUrl}`);
+async function downloadVideo(video, http = axios, maxBytes = MAX_VIDEO_BYTES) {
+  const url = getCandidateUrl(video);
+  const response = await http.get(url, {
+    responseType: "arraybuffer",
+    timeout: REQUEST_TIMEOUT_MS,
+    maxContentLength: maxBytes,
+    maxBodyLength: maxBytes,
+    maxRedirects: 4,
+    headers: {
+      Accept: "video/mp4,application/octet-stream;q=0.9,*/*;q=0.5",
+      "User-Agent": USER_AGENT,
+      Referer: `${TIKWM_ORIGIN}/`
+    }
+  });
+
+  const buffer = Buffer.isBuffer(response && response.data)
+    ? response.data
+    : Buffer.from((response && response.data) || []);
+  if (!buffer.length) throw makeError("VIDEO_EMPTY", "Le fichier vidéo reçu est vide.");
+  if (buffer.length > maxBytes) throw makeError("VIDEO_TOO_LARGE", "La vidéo dépasse la limite d’envoi Messenger.");
+  if (!isMp4(buffer)) throw makeError("VIDEO_NOT_MP4", "Le fichier reçu n’est pas une vidéo MP4 valide.");
+  return { buffer, url };
+}
+
+function isAxiosSizeLimitError(error) {
+  const message = String(error && error.message || "");
+  return Boolean(error && (error.code === "ERR_FR_MAX_BODY_LENGTH_EXCEEDED" || /maxContentLength|maxBodyLength/i.test(message)));
+}
+
+async function searchAndDownload(query, http = axios) {
+  const videos = await searchTikTok(query, http);
+  if (!videos.length) return { status: "not-found" };
+
+  const candidates = videos.filter(isCandidate);
+  const sawOversized = videos.some(video => Number(video && video.size) > MAX_VIDEO_BYTES);
+  if (!candidates.length) {
+    return { status: sawOversized ? "too-large" : "unavailable" };
+  }
+
+  let lastError = null;
+  for (const video of candidates.slice(0, MAX_DOWNLOAD_ATTEMPTS)) {
+    try {
+      const downloaded = await downloadVideo(video, http);
+      return { status: "ok", video, ...downloaded };
+    } catch (error) {
+      lastError = isAxiosSizeLimitError(error)
+        ? makeError("VIDEO_TOO_LARGE", "La vidéo dépasse la limite d’envoi Messenger.")
+        : error;
+    }
+  }
+
+  if (lastError && lastError.code === "VIDEO_TOO_LARGE") return { status: "too-large" };
+  return { status: "download-failed", error: lastError };
+}
+
+function makeTikTokLink(video) {
+  const id = cleanText(video && (video.video_id || video.id), 80);
+  const author = video && video.author && video.author.unique_id;
+  const username = cleanText(author, 80).replace(/^@/, "");
+  if (!id) return "";
+  return username
+    ? `https://www.tiktok.com/@${encodeURIComponent(username)}/video/${encodeURIComponent(id)}`
+    : `https://www.tiktok.com/video/${encodeURIComponent(id)}`;
+}
+
+function makeCaption(query, video) {
+  const title = cleanText(video && (video.title || video.desc || video.description), 240) || "Vidéo TikTok";
+  const author = video && video.author || {};
+  const nickname = cleanText(author.nickname || author.unique_id, 100) || "Créateur TikTok";
+  const username = cleanText(author.unique_id, 80).replace(/^@/, "");
+  const duration = Number(video && video.duration);
+  const lines = [
+    `🎵 Résultat TikTok pour « ${cleanText(query, MAX_QUERY_CHARS)} »`,
+    `📌 ${title}`,
+    `👤 ${nickname}${username ? ` (@${username})` : ""}`
+  ];
+  if (Number.isFinite(duration) && duration > 0) lines.push(`⏱️ ${duration} s`);
+  const link = makeTikTokLink(video);
+  if (link) lines.push(`🔗 ${link}`);
+  lines.push("ℹ️ Source : TikTok via TikWM. Respecte les droits du créateur.");
   return lines.join("\n");
 }
 
-function explainError(error, stage) {
-  const status = error && error.response && error.response.status;
-  if (error && error.blocked) {
-    return `❌ Accès refusé (HTTP 403) pendant « ${stage} » : le service TikTok bloque l'adresse IP du serveur du bot.\n🔧 ${String(error.message).slice(0, 220)}`;
-  }
-  if (status === 429 || /limit|too many/i.test(String(error && error.message))) {
-    return "❌ Le service TikTok est saturé. Réessaie dans quelques secondes.";
-  }
-  if (status === 403) return "❌ Le service TikTok a refusé la requête (HTTP 403). Réessaie plus tard.";
-  if (error && (error.code === "ECONNABORTED" || error.code === "ETIMEDOUT")) {
-    return `❌ Délai dépassé pendant l'étape « ${stage} ». Réessaie.`;
-  }
-  return `❌ Échec de l'étape « ${stage} » : ${String(error && error.message || "erreur inconnue").replace(/\s+/g, " ").slice(0, 260)}`;
+function requestKey(event = {}) {
+  const threadID = String(event.threadID || "");
+  const senderID = String(event.senderID || event.messageID || "inconnu");
+  return `${threadID}:${senderID}`;
 }
 
-// ───────────────────────── Commande ─────────────────────────
-async function run({ api, message, event, args, prefix }, deps = defaultDeps) {
-  const reply = payload => send({ api, message, event }, payload);
-  const pfx = prefix || "!";
-  const query = cleanQuery(args);
+function messageForError(result, query) {
+  if (result.status === "not-found") return `🔎 Je n’ai trouvé aucune vidéo TikTok pour « ${cleanText(query, MAX_QUERY_CHARS)} ». Essaie un autre mot-clé.`;
+  if (result.status === "too-large") return "📦 Les vidéos trouvées dépassent la taille maximale d’envoi Messenger. Essaie un mot-clé plus précis.";
+  if (result.status === "unavailable") return "⚠️ Des résultats ont été trouvés, mais aucune vidéo téléchargeable et compatible n’est disponible.";
+  if (result.status === "download-failed") return "❌ La vidéo a été trouvée, mais son téléchargement a échoué. Réessaie plus tard.";
+  return "❌ Le service de recherche TikTok est momentanément indisponible. Réessaie dans un instant.";
+}
+
+async function handleTikTok(context = {}, dependencies = {}) {
+  const { api, message, event, prefix } = context;
+  const query = getQuery(context);
+  const currentPrefix = prefix || getPrefixes(context)[0];
 
   if (!query) {
-    return reply(`🎵 Utilisation : ${pfx}tiktok <recherche>\nExemple : ${pfx}tiktok chat drôle\nTu peux aussi coller un lien TikTok.`);
+    return send({ api, message, event }, `🎵 Utilisation : ${currentPrefix}tiktok <recherche>\nExemple : ${currentPrefix}tiktok Naruto`);
   }
-  if (!api || typeof api.sendMessage !== "function" || !event || !event.threadID) {
-    return reply("❌ L'API Messenger ou la conversation est indisponible.");
+  const queryLength = Array.from(query).length;
+  if (queryLength < 2 || queryLength > MAX_QUERY_CHARS) {
+    return send({ api, message, event }, `❌ Le mot-clé doit contenir entre 2 et ${MAX_QUERY_CHARS} caractères.`);
   }
-
-  const userID = getUserID(event);
-  const now = deps.now();
-  if (userID) {
-    if (running.has(userID)) return reply("⏳ Ta précédente recherche TikTok est encore en cours.");
-    const until = cooldowns.get(userID) || 0;
-    if (until > now) {
-      return reply(`⏳ Patiente encore ${Math.ceil((until - now) / 1000)} s avant une nouvelle recherche TikTok.`);
-    }
-    running.add(userID);
+  if (!event || !event.threadID || !api || typeof api.sendMessage !== "function") {
+    return send({ api, message, event }, "❌ L’API Messenger ou l’identifiant de la conversation est indisponible.");
   }
 
-  let stage = "recherche TikTok";
+  const key = requestKey(event);
+  if (activeRequests.has(key)) {
+    return send({ api, message, event }, "⏳ Une recherche TikTok est déjà en cours pour toi dans cette conversation.");
+  }
+  if (activeRequests.size >= MAX_CONCURRENT_REQUESTS) {
+    return send({ api, message, event }, "⏳ Trop de recherches vidéo sont en cours. Réessaie dans quelques instants.");
+  }
+
+  activeRequests.add(key);
   let tempDir;
-  let stream;
+  let videoStream;
   try {
-    await reply(isTikTokUrl(query) ? "🔗 Lecture du lien TikTok…" : `🔎 Recherche TikTok : « ${query} »…`);
+    const http = dependencies.http || axios;
+    const result = await searchAndDownload(query, http);
+    if (result.status !== "ok") return send({ api, message, event }, messageForError(result, query));
 
-    const byLink = isTikTokUrl(query);
-    const candidates = byLink ? await resolveVideoUrl(query, deps) : await searchVideos(query, deps);
-    if (!candidates.length) {
-      return reply(`🔎 Aucune vidéo TikTok trouvée pour « ${query} ». Essaie d'autres mots-clés.`);
-    }
+    tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "goat-tiktok-"));
+    const videoPath = path.join(tempDir, "tiktok-video.mp4");
+    await fs.promises.writeFile(videoPath, result.buffer, { flag: "wx" });
+    const stat = await fs.promises.stat(videoPath);
+    if (!stat.size || stat.size > MAX_VIDEO_BYTES) throw makeError("VIDEO_TOO_LARGE", "Le MP4 temporaire dépasse la limite Messenger.");
 
-    const eligible = candidates.filter(video => isCandidateAllowed(video, deps)).slice(0, MAX_CANDIDATES);
-    if (!eligible.length) {
-      return reply("❌ Les vidéos trouvées sont trop lourdes ou trop longues pour Messenger (max 25 Mo / 10 min). Essaie une autre recherche.");
-    }
-
-    stage = "téléchargement de la vidéo";
-    let chosen = null;
-    let buffer = null;
-    let lastError = null;
-    let blockedCount = 0;
-    for (const video of eligible) {
-      try {
-        buffer = await downloadVideo(video, deps);
-        chosen = video;
-        break;
-      } catch (error) {
-        lastError = error;
-        console.warn(`[Commande tiktok] Vidéo ${video.id || "?"} ignorée : ${errorText(error)}`);
-        // Deux refus d'accès d'affilée = l'IP est bloquée, inutile d'insister.
-        if (error && error.blocked && ++blockedCount >= 2) break;
-      }
-    }
-    if (!chosen) throw lastError || new Error("Aucune vidéo téléchargeable.");
-
-    stage = "création du fichier temporaire";
-    tempDir = await deps.fs.promises.mkdtemp(path.join(os.tmpdir(), "goat-tiktok-"));
-    const filePath = path.join(tempDir, `tiktok-${deps.now()}.mp4`);
-    await deps.fs.promises.writeFile(filePath, buffer);
-
-    stage = "envoi sur Messenger";
-    stream = deps.fs.createReadStream(filePath);
-    await api.sendMessage({ body: buildCaption(chosen, query, byLink), attachment: stream }, event.threadID);
-
-    if (userID) cooldowns.set(userID, deps.now() + COOLDOWN_MS);
-    return true;
+    videoStream = fs.createReadStream(videoPath);
+    return await api.sendMessage({
+      body: makeCaption(query, result.video),
+      attachment: videoStream
+    }, event.threadID);
   } catch (error) {
-    console.error(`[Commande tiktok] Échec étape « ${stage} » :`, error && error.stack || error);
+    console.error("[Commande tiktok] Échec de la recherche ou de l’envoi :", error && (error.stack || error.message) || error);
+    const text = error && error.code === "SEARCH_FAILED"
+      ? "❌ Le service TikTok a refusé la recherche. Réessaie plus tard."
+      : "❌ Impossible de récupérer ou d’envoyer cette vidéo TikTok pour le moment.";
     try {
-      return await reply(explainError(error, stage));
+      return await send({ api, message, event }, text);
     } catch (replyError) {
-      console.error("[Commande tiktok] Impossible d'envoyer le diagnostic :", replyError && replyError.stack || replyError);
+      console.error("[Commande tiktok] Impossible d’envoyer le message d’erreur :", replyError && replyError.message || replyError);
       return null;
     }
   } finally {
-    if (userID) running.delete(userID);
-    if (stream && typeof stream.destroy === "function" && !stream.destroyed) stream.destroy();
+    if (videoStream && !videoStream.destroyed) videoStream.destroy();
     if (tempDir) {
-      await deps.fs.promises.rm(tempDir, { recursive: true, force: true })
-        .catch(error => console.error("[Commande tiktok] Nettoyage temporaire :", error.message));
+      await fs.promises.rm(tempDir, { recursive: true, force: true })
+        .catch(error => console.error("[Commande tiktok] Nettoyage du fichier temporaire :", error.message));
     }
+    activeRequests.delete(key);
   }
 }
 
 module.exports = {
   config: {
     name: "tiktok",
-    aliases: ["tt"],
     version: "1.0.0",
     author: "Diwate",
-    description: "Recherche une vidéo TikTok (ou lit un lien) et l'envoie sur Messenger",
+    description: "Recherche une vidéo TikTok par mot-clé et l’envoie sur Messenger",
     category: "Médias",
-    usages: "tiktok <recherche | lien>",
+    usages: "tiktok <recherche>",
     role: 0
   },
-
-  // exposés pour les tests
-  cleanQuery,
-  isTikTokUrl,
-  searchVideos,
-  resolveVideoUrl,
+  getQuery,
+  getVideos,
+  getVideoUrl,
+  isMp4,
+  searchTikTok,
   downloadVideo,
-  normalizeVideo,
-  run,
-  _state: { cooldowns, running },
-
-  onStart: function (context) {
-    return run(context, defaultDeps);
+  searchAndDownload,
+  makeTikTokLink,
+  makeCaption,
+  handleTikTok,
+  MAX_QUERY_CHARS,
+  MAX_VIDEO_BYTES,
+  SEARCH_URL,
+  MAX_CONCURRENT_REQUESTS,
+  onStart: async function (context) {
+    return handleTikTok(context);
   }
 };
