@@ -140,7 +140,7 @@ async function handleBank(context = {}) {
   if (["balance", "solde", ""].includes(subCommand)) {
     const target = getReplyTarget(event);
     const userId = target ? target.id : senderID;
-    const label = target ? target.name : "toi";
+    const label = target ? target.name : "***";
     try {
       const balance = await getBalance(globalData, userId);
       return send(
