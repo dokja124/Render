@@ -5,7 +5,8 @@ const path = require("path");
 const { send } = require("./lib/messenger");
 
 const THREAD_LIST_LIMIT = 9999999;
-const BROADCAST_DELAY_MS = 1500;
+const BROADCAST_DELAY_MS = 1500;        // délai entre deux groupes
+const PHASE_DELAY_MS = 2000;            // délai entre la fin de la passe texte et le début de la passe photo
 const MAX_ANNOUNCEMENT_CHARS = 1700;
 const MAX_STYLED_MESSAGE_CHARS = 1900;
 const MAX_REMEMBERED_MESSAGE_IDS = 500;
@@ -13,6 +14,10 @@ const ANNOUNCEMENT_IMAGE_NAME = "Diwate.jpg";
 
 const processedMessageIDs = new Map();
 let broadcastInProgress = false;
+
+// ---------------------------------------------------------------------------
+// Utilitaires
+// ---------------------------------------------------------------------------
 
 function normalizeID(value) {
   if (value == null) return "";
@@ -76,7 +81,6 @@ function extractAnnouncement(context = {}) {
       break;
     }
   }
-
   if (Array.isArray(context.args)) return cleanAnnouncement(context.args.join(" "));
   if (typeof context.args === "string") return cleanAnnouncement(context.args);
   return "";
@@ -92,14 +96,25 @@ function formatAnnouncement(text) {
   ].join("\n");
 }
 
+/**
+ * Détection large des groupes : isGroup, threadType numérique/chaîne, type, community.
+ */
 function getGroupIDs(threadList) {
   if (!Array.isArray(threadList)) return [];
   const ids = new Set();
   for (const thread of threadList) {
     if (!thread || typeof thread !== "object") continue;
-    const isGroup = thread.isGroup === true
-      || thread.threadType === 2
-      || String(thread.threadType || "").toUpperCase() === "GROUP";
+    const threadTypeRaw = thread.threadType != null ? String(thread.threadType).toUpperCase() : "";
+    const typeRaw = thread.type != null ? String(thread.type).toUpperCase() : "";
+    const isGroup =
+      thread.isGroup === true ||
+      thread.isGroup === 1 ||
+      thread.isGroup === "true" ||
+      thread.threadType === 2 ||
+      threadTypeRaw === "GROUP" ||
+      threadTypeRaw === "2" ||
+      typeRaw === "GROUP" ||
+      thread.community === true;
     if (!isGroup) continue;
     const threadID = normalizeID(thread.threadID || thread.threadId || thread.id);
     if (!/^\d+$/.test(threadID)) continue;
@@ -108,10 +123,6 @@ function getGroupIDs(threadList) {
   return Array.from(ids);
 }
 
-/**
- * Cherche les images directement dans le dossier assets.
- * Le module peut être placé dans scripts/cmds, dans cmds ou à la racine.
- */
 function getAssetsDirectories() {
   return Array.from(new Set([
     path.resolve(__dirname, "../../assets"),
@@ -125,12 +136,9 @@ function getAnnouncementImagePath() {
   for (const directory of getAssetsDirectories()) {
     const imagePath = path.join(directory, ANNOUNCEMENT_IMAGE_NAME);
     try {
-      if (fs.statSync(imagePath).isFile() && fs.statSync(imagePath).size > 0) {
-        return imagePath;
-      }
-    } catch (_) {
-      // Continue la recherche dans les autres emplacements possibles de assets.
-    }
+      const stat = fs.statSync(imagePath);
+      if (stat.isFile() && stat.size > 0) return imagePath;
+    } catch (_) {}
   }
   return null;
 }
@@ -151,38 +159,27 @@ function wait(ms) {
 }
 
 function helpText(prefix) {
-  return `📢 Utilisation : ${prefix}annonce <message>\nExemple : ${prefix}annonce 🌸 Réunion à 18 h, soyez présents !\n\n🖼️ Une image sera jointe automatiquement depuis le dossier assets.`;
+  return `📢 Utilisation : ${prefix}annonce <message>\nExemple : ${prefix}annonce 🌸 Réunion à 18 h, soyez présents !\n\n🖼️ Envoi en deux passes : d'abord le texte dans les groupes, puis la photo uniquement dans ceux qui ont reçu le texte.`;
 }
 
-/**
- * Envoi compatible avec l'API Messenger de type FCA/GoatBot.
- * Un nouveau ReadStream est créé pour chaque groupe : un flux déjà consommé
- * ne peut pas être réutilisé pour les groupes suivants.
- */
-function sendAnnouncementToGroup(api, text, imagePath, threadID) {
+// ---------------------------------------------------------------------------
+// Envoi bas niveau (callback OU Promise)
+// ---------------------------------------------------------------------------
+
+function sendTextToGroup(api, text, threadID) {
   return new Promise((resolve, reject) => {
     let settled = false;
-    let stream;
-    const finish = (error, result) => {
+    const finish = (error, info) => {
       if (settled) return;
       settled = true;
-      if (error && stream && typeof stream.destroy === "function") stream.destroy();
       if (error) reject(error);
-      else resolve(result);
+      else resolve(info);
     };
-
     try {
-      stream = fs.createReadStream(imagePath);
-      stream.once("error", error => finish(error));
-      const payload = { body: text, attachment: stream };
-      const callback = (error, info) => finish(error || null, info);
-      const result = api.sendMessage(payload, threadID, callback);
-
-      // Certaines versions renvoient une Promise, d'autres utilisent le callback.
+      const result = api.sendMessage(text, threadID, (error, info) => finish(error || null, info));
       if (result && typeof result.then === "function") {
         result.then(value => finish(null, value), error => finish(error));
       } else if (api.sendMessage.length < 3) {
-        // API sans callback : l'appel synchrone est considéré comme accepté.
         finish(null, result);
       }
     } catch (error) {
@@ -190,6 +187,37 @@ function sendAnnouncementToGroup(api, text, imagePath, threadID) {
     }
   });
 }
+
+function sendPhotoToGroup(api, imagePath, threadID) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    let stream;
+    const finish = (error, info) => {
+      if (settled) return;
+      settled = true;
+      if (error && stream && typeof stream.destroy === "function") stream.destroy();
+      if (error) reject(error);
+      else resolve(info);
+    };
+    try {
+      stream = fs.createReadStream(imagePath);
+      stream.once("error", error => finish(error));
+      const payload = { attachment: stream };
+      const result = api.sendMessage(payload, threadID, (error, info) => finish(error || null, info));
+      if (result && typeof result.then === "function") {
+        result.then(value => finish(null, value), error => finish(error));
+      } else if (api.sendMessage.length < 3) {
+        finish(null, result);
+      }
+    } catch (error) {
+      finish(error);
+    }
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Commande principale
+// ---------------------------------------------------------------------------
 
 async function handleAnnouncement(context = {}, dependencies = {}) {
   const { api, message, event } = context;
@@ -216,18 +244,14 @@ async function handleAnnouncement(context = {}, dependencies = {}) {
     return send({ api, message, event }, "❌ L’API Messenger ne permet pas de récupérer les groupes ou d’envoyer les messages.");
   }
 
-  // Vérifier l'image avant de marquer la commande comme traitée et avant tout envoi.
   const imagePath = typeof dependencies.getImagePath === "function"
     ? dependencies.getImagePath()
     : getAnnouncementImagePath();
-  if (!imagePath) {
+  if (!imagePath || !fs.existsSync(imagePath)) {
     return send(
       { api, message, event },
-      `❌ Photo introuvable : assets/${ANNOUNCEMENT_IMAGE_NAME}. Vérifie que le fichier existe avec exactement ce nom.`,
+      `❌ Photo introuvable : assets/${ANNOUNCEMENT_IMAGE_NAME}. Vérifie que le fichier existe avec exactement ce nom.`
     );
-  }
-  if (!fs.existsSync(imagePath)) {
-    return send({ api, message, event }, "❌ La photo sélectionnée est introuvable ou a été supprimée. Vérifie le dossier assets.");
   }
 
   if (rememberMessageID(event)) {
@@ -235,64 +259,183 @@ async function handleAnnouncement(context = {}, dependencies = {}) {
   }
 
   broadcastInProgress = true;
-  let groupCount = 0;
-  let sentCount = 0;
-  let failedCount = 0;
-  let broadcastStarted = false;
-  let broadcastFinished = false;
+
+  const delayMs = Number.isFinite(dependencies.delayMs)
+    ? Math.max(0, Math.floor(dependencies.delayMs))
+    : BROADCAST_DELAY_MS;
+  const phaseDelayMs = Number.isFinite(dependencies.phaseDelay)
+    ? Math.max(0, Math.floor(dependencies.phaseDelay))
+    : PHASE_DELAY_MS;
+  const sleep = typeof dependencies.sleep === "function" ? dependencies.sleep : wait;
+
+  let groupIDs = [];
+  let textSentIDs = [];        // groupes où le TEXTE est passé
+  let photoSentIDs = [];       // groupes où la PHOTO est passée (parmi textSentIDs)
+  let textFailedIDs = [];      // groupes où le texte a échoué
+  let photoFailedIDs = [];     // groupes où le texte est passé mais la photo a échoué
+
+  let phaseTextStarted = false;
+  let phaseTextDone = false;
+  let phasePhotoStarted = false;
+  let phasePhotoDone = false;
 
   try {
     const threadList = await api.getThreadList(THREAD_LIST_LIMIT, null, "INBOX");
     if (!Array.isArray(threadList)) {
       throw new Error("Messenger n’a pas retourné une liste de conversations valide.");
     }
-    const groupIDs = getGroupIDs(threadList);
-    groupCount = groupIDs.length;
+    groupIDs = getGroupIDs(threadList);
     if (groupIDs.length === 0) {
       return send({ api, message, event }, "ℹ️ Aucun groupe Messenger actif n’a été trouvé; rien n’a été envoyé.");
     }
 
     const imageName = path.basename(imagePath);
+
+    // ------------------------------------------------------------------
+    // PHASE 1 — Texte dans tous les groupes
+    // ------------------------------------------------------------------
     await send(
       { api, message, event },
-      `📡 Diffusion lancée vers ${groupIDs.length} groupe(s).\n🖼️ Photo jointe : ${imageName}\n⏳ Envoi un par un…`
+      `📡 PHASE 1/2 — Envoi du texte dans ${groupIDs.length} groupe(s)…\n🖼️ La photo suivra uniquement dans les groupes où le texte est bien parti.`
     );
-    broadcastStarted = true;
-
-    const delayMs = Number.isFinite(dependencies.delayMs)
-      ? Math.max(0, Math.floor(dependencies.delayMs))
-      : BROADCAST_DELAY_MS;
-    const sleep = typeof dependencies.sleep === "function" ? dependencies.sleep : wait;
+    phaseTextStarted = true;
 
     for (let index = 0; index < groupIDs.length; index++) {
       const threadID = groupIDs[index];
       try {
-        await sendAnnouncementToGroup(api, styledMessage, imagePath, threadID);
-        sentCount++;
+        await sendTextToGroup(api, styledMessage, threadID);
+        textSentIDs.push(threadID);
       } catch (error) {
-        failedCount++;
-        console.error(`[Commande annonce] Échec d’envoi au groupe ${index + 1}/${groupIDs.length} (${threadID}) :`, error && (error.stack || error.message) || error);
+        textFailedIDs.push(threadID);
+        console.error(
+          `[Commande annonce] PHASE 1 — Échec texte ${index + 1}/${groupIDs.length} (${threadID}) :`,
+          error && (error.stack || error.message) || error
+        );
       }
       if (index < groupIDs.length - 1 && delayMs > 0) await sleep(delayMs);
     }
-    broadcastFinished = true;
+    phaseTextDone = true;
 
-    const summary = [
-      "✅ Diffusion terminée.",
-      `📨 Annonces + photos envoyées : ${sentCount}/${groupIDs.length}`,
-      `⚠️ Échecs : ${failedCount}`,
-      `🖼️ Photo utilisée : ${imageName}`
-    ].join("\n");
-    return await send({ api, message, event }, summary);
+    if (textSentIDs.length === 0) {
+      return send(
+        { api, message, event },
+        `⚠️ PHASE 1 terminée : aucun texte n’a pu être envoyé (0/${groupIDs.length}).\n❌ PHASE 2 annulée : aucune photo n’a été diffusée.\nConsulte les logs Render pour connaître les causes.`
+      );
+    }
+
+    await send(
+      { api, message, event },
+      `✅ PHASE 1 terminée : texte envoyé dans ${textSentIDs.length}/${groupIDs.length} groupe(s).\n⏳ Pause de ${Math.round(phaseDelayMs / 1000)} s avant la photo…`
+    );
+
+    // ------------------------------------------------------------------
+    // PHASE 2 — Photo uniquement dans les groupes où le texte est passé
+    // ------------------------------------------------------------------
+    if (phaseDelayMs > 0) await sleep(phaseDelayMs);
+
+    await send(
+      { api, message, event },
+      `🖼️ PHASE 2/2 — Envoi de ${imageName} dans ${textSentIDs.length} groupe(s) où le texte a bien été reçu…`
+    );
+    phasePhotoStarted = true;
+
+    for (let index = 0; index < textSentIDs.length; index++) {
+      const threadID = textSentIDs[index];
+      try {
+        await sendPhotoToGroup(api, imagePath, threadID);
+        photoSentIDs.push(threadID);
+      } catch (error) {
+        photoFailedIDs.push(threadID);
+        console.error(
+          `[Commande annonce] PHASE 2 — Échec photo ${index + 1}/${textSentIDs.length} (${threadID}) :`,
+          error && (error.stack || error.message) || error
+        );
+      }
+      if (index < textSentIDs.length - 1 && delayMs > 0) await sleep(delayMs);
+    }
+    phasePhotoDone = true;
+
+    // ------------------------------------------------------------------
+    // Résumé final
+    // ------------------------------------------------------------------
+    const summaryLines = [
+      "✅ Diffusion terminée (2 passes).",
+      "",
+      `📝 PHASE 1 — Texte : ${textSentIDs.length}/${groupIDs.length} envoyé(s)`,
+      `🖼️ PHASE 2 — Photo : ${photoSentIDs.length}/${textSentIDs.length} envoyée(s)`,
+      "",
+      `⚠️ Échecs texte : ${textFailedIDs.length}`,
+      `⚠️ Échecs photo (après texte OK) : ${photoFailedIDs.length}`,
+      `📎 Photo utilisée : ${imageName}`
+    ];
+    if (textFailedIDs.length > 0) {
+      summaryLines.push("", "Groupes sans texte (photo non tentée) :", textFailedIDs.slice(0, 8).map(id => `• ${id}`).join("\n"));
+      if (textFailedIDs.length > 8) summaryLines.push(`… +${textFailedIDs.length - 8} autres`);
+    }
+    if (photoFailedIDs.length > 0) {
+      summaryLines.push("", "Groupes avec texte mais sans photo :", photoFailedIDs.slice(0, 8).map(id => `• ${id}`).join("\n"));
+      if (photoFailedIDs.length > 8) summaryLines.push(`… +${photoFailedIDs.length - 8} autres`);
+    }
+
+    return await send({ api, message, event }, summaryLines.join("\n"));
   } catch (error) {
-    console.error("[Commande annonce] Diffusion interrompue avant ou pendant la récupération des groupes :", error && (error.stack || error.message) || error);
-    if (broadcastFinished) {
-      return send({ api, message, event }, `⚠️ Les annonces ont été envoyées (${sentCount}/${groupCount}), mais le résumé final n’a pas pu être transmis. Consulte les logs Render.`);
+    console.error(
+      "[Commande annonce] Diffusion interrompue :",
+      error && (error.stack || error.message) || error
+    );
+
+    const state = {
+      totalGroups: groupIDs.length,
+      textSent: textSentIDs.length,
+      textFailed: textFailedIDs.length,
+      photoSent: photoSentIDs.length,
+      photoFailed: photoFailedIDs.length,
+      phaseTextStarted,
+      phaseTextDone,
+      phasePhotoStarted,
+      phasePhotoDone
+    };
+
+    if (phasePhotoDone) {
+      return send(
+        { api, message, event },
+        `⚠️ Diffusion terminée mais le résumé final n’a pas pu être transmis.\n` +
+        `Texte : ${state.textSent}/${state.totalGroups} • Photo : ${state.photoSent}/${state.textSent || 0}\n` +
+        `Consulte les logs Render.`
+      );
     }
-    if (broadcastStarted) {
-      return send({ api, message, event }, `⚠️ La diffusion a été interrompue. Envois confirmés : ${sentCount}/${groupCount}; certains groupes ont peut-être déjà reçu l’annonce. Consulte les logs avant de relancer.`);
+
+    if (phasePhotoStarted) {
+      return send(
+        { api, message, event },
+        `⚠️ Diffusion interrompue pendant la PHASE 2 (photo).\n` +
+        `Texte : ${state.textSent}/${state.totalGroups} • Photo envoyée : ${state.photoSent}/${state.textSent}\n` +
+        `Consulte les logs avant de relancer.`
+      );
     }
-    return send({ api, message, event }, "❌ Diffusion annulée avant le premier envoi. Vérifie la connexion Messenger et les logs Render, puis réessaie.");
+
+    if (phaseTextDone) {
+      return send(
+        { api, message, event },
+        `⚠️ Diffusion interrompue entre les deux phases.\n` +
+        `Texte : ${state.textSent}/${state.totalGroups} envoyé(s) • Aucune photo n’a été envoyée.\n` +
+        `Consulte les logs avant de relancer.`
+      );
+    }
+
+    if (phaseTextStarted) {
+      return send(
+        { api, message, event },
+        `⚠️ Diffusion interrompue pendant la PHASE 1 (texte).\n` +
+        `Texte : ${state.textSent}/${state.totalGroups} • Aucune photo envoyée.\n` +
+        `Consulte les logs avant de relancer.`
+      );
+    }
+
+    return send(
+      { api, message, event },
+      "❌ Diffusion annulée avant le premier envoi. Vérifie la connexion Messenger et les logs Render, puis réessaie."
+    );
   } finally {
     broadcastInProgress = false;
   }
@@ -301,9 +444,9 @@ async function handleAnnouncement(context = {}, dependencies = {}) {
 module.exports = {
   config: {
     name: "annonce",
-    version: "2.1.0",
+    version: "3.0.0",
     author: "Diwate",
-    description: "Diffuse une annonce accompagnée d'une photo du dossier assets dans les groupes du bot",
+    description: "Diffuse une annonce en deux passes : texte dans tous les groupes, puis photo uniquement où le texte est passé",
     category: "Administration",
     usages: "annonce <message>",
     role: 0
@@ -317,9 +460,11 @@ module.exports = {
   getAssetsDirectories,
   getAnnouncementImagePath,
   ANNOUNCEMENT_IMAGE_NAME,
-  sendAnnouncementToGroup,
+  sendTextToGroup,
+  sendPhotoToGroup,
   handleAnnouncement,
   BROADCAST_DELAY_MS,
+  PHASE_DELAY_MS,
   MAX_ANNOUNCEMENT_CHARS,
   onStart: async function (context) {
     return handleAnnouncement(context);
