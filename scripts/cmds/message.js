@@ -2,9 +2,9 @@
 
 const { send } = require("./lib/messenger");
 
-const STORAGE_KEY = "privateMessagesV2";
-const INDEX_KEY = "privateMessagesUsersV2";
-const ACTIVITY_KEY = "privateMessagesActivityV2"; // { userId: { threadID: count } }
+const STORAGE_KEY = "privateMessagesV3";
+const INDEX_KEY = "privateMessagesUsersV3";
+const ACTIVITY_KEY = "privateMessagesActivityV3";
 const MAX_MESSAGE_LENGTH = 1500;
 const MAX_INBOX = 50;
 const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
@@ -16,10 +16,6 @@ let knownUsers = null;
 let activity = null;
 let loadPromise = null;
 let mutationQueue = Promise.resolve();
-
-// ---------------------------------------------------------------------------
-// Utilitaires
-// ---------------------------------------------------------------------------
 
 function normalizeID(value) {
   if (value == null) return "";
@@ -71,9 +67,9 @@ function getOwnerDisplayName() {
   return cleanName(config.ownerName || config.botName || "Propriétaire", "Propriétaire");
 }
 
-function formatDate(timestamp) {
+function formatDate(ts) {
   try {
-    const d = new Date(timestamp);
+    const d = new Date(ts);
     const pad = n => String(n).padStart(2, "0");
     return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
   } catch (_) { return "date inconnue"; }
@@ -82,10 +78,6 @@ function formatDate(timestamp) {
 function makeMessageID() {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
-
-// ---------------------------------------------------------------------------
-// Persistance
-// ---------------------------------------------------------------------------
 
 async function loadAll(globalData) {
   if (store && knownUsers && activity) return { store, knownUsers, activity };
@@ -98,15 +90,15 @@ async function loadAll(globalData) {
       try {
         const s = await globalData.get(STORAGE_KEY, "data", {});
         if (s && typeof s === "object" && !Array.isArray(s)) store = { ...s };
-      } catch (e) { console.warn("[Message] Lecture messages :", e.message || e); }
+      } catch (e) { console.warn("[Message] messages :", e.message || e); }
       try {
         const u = await globalData.get(INDEX_KEY, "data", {});
         if (u && typeof u === "object" && !Array.isArray(u)) knownUsers = { ...u };
-      } catch (e) { console.warn("[Message] Lecture users :", e.message || e); }
+      } catch (e) { console.warn("[Message] users :", e.message || e); }
       try {
         const a = await globalData.get(ACTIVITY_KEY, "data", {});
         if (a && typeof a === "object" && !Array.isArray(a)) activity = { ...a };
-      } catch (e) { console.warn("[Message] Lecture activity :", e.message || e); }
+      } catch (e) { console.warn("[Message] activity :", e.message || e); }
     }
     const now = Date.now();
     for (const [id, msg] of Object.entries(store)) {
@@ -123,7 +115,7 @@ async function persist(globalData, which) {
     if (which === "messages" || which === "all") await globalData.set(STORAGE_KEY, store, "data");
     if (which === "users" || which === "all") await globalData.set(INDEX_KEY, knownUsers, "data");
     if (which === "activity" || which === "all") await globalData.set(ACTIVITY_KEY, activity, "data");
-  } catch (e) { console.warn("[Message] Sauvegarde :", e.message || e); }
+  } catch (e) { console.warn("[Message] sauvegarde :", e.message || e); }
 }
 
 async function mutate(globalData, fn) {
@@ -138,6 +130,9 @@ async function mutate(globalData, fn) {
   return pending;
 }
 
+/**
+ * Enregistre un utilisateur dans knownUsers. Appelé depuis trackActivity.
+ */
 async function rememberUser(globalData, userID, name) {
   const id = normalizeID(userID);
   if (!id) return;
@@ -159,13 +154,9 @@ async function rememberUser(globalData, userID, name) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Suivi d'activité : à appeler à chaque message d'un utilisateur
-// ---------------------------------------------------------------------------
-
 /**
- * Enregistre une activité dans le groupe courant.
- * À appeler depuis onEvent.js (ou onChat) à chaque message.
+ * Enregistre une activité : à appeler à CHAQUE message utilisateur (depuis onEvent).
+ * Enregistre aussi l'utilisateur dans knownUsers pour qu'il apparaisse dans la liste.
  */
 async function trackActivity(context = {}) {
   const { event, globalData } = context;
@@ -174,6 +165,8 @@ async function trackActivity(context = {}) {
   if (!userID || !threadID) return;
 
   await loadAll(globalData);
+
+  // 1. Compteur d'activité (pour le routage des notifications)
   await mutate(globalData, () => {
     if (!activity[userID] || typeof activity[userID] !== "object") activity[userID] = {};
     activity[userID][threadID] = (Number(activity[userID][threadID]) || 0) + 1;
@@ -185,27 +178,23 @@ async function trackActivity(context = {}) {
     }
     return { persist: "activity" };
   });
+
+  // 2. Enregistrement dans knownUsers (pseudo)
+  const name = await resolveDisplayName(context, userID);
+  await rememberUser(globalData, userID, name);
 }
 
-/**
- * Renvoie le threadID le plus actif pour un utilisateur, ou null.
- */
 async function getMostActiveThread(globalData, userID) {
   await loadAll(globalData);
   const map = activity[normalizeID(userID)];
   if (!map || typeof map !== "object") return null;
-  let best = null;
-  let bestCount = 0;
+  let best = null, bestCount = 0;
   for (const [tid, count] of Object.entries(map)) {
     const n = Number(count) || 0;
     if (n > bestCount) { bestCount = n; best = tid; }
   }
   return best;
 }
-
-// ---------------------------------------------------------------------------
-// Résolution du pseudo
-// ---------------------------------------------------------------------------
 
 async function resolveDisplayName(context, userID) {
   const id = normalizeID(userID);
@@ -223,7 +212,6 @@ async function resolveDisplayName(context, userID) {
       if (name) return cleanName(name);
     } catch (_) {}
   }
-
   const api = context.api;
   if (api && typeof api.getUserInfo === "function") {
     try {
@@ -235,10 +223,6 @@ async function resolveDisplayName(context, userID) {
   }
   return `Utilisateur ${id.slice(-4)}`;
 }
-
-// ---------------------------------------------------------------------------
-// Construction de la liste des destinataires
-// ---------------------------------------------------------------------------
 
 async function buildRecipientsList(context) {
   const { globalData, event } = context;
@@ -272,13 +256,13 @@ function buildRecipientsText(prefix, list) {
     "",
     lines.join("\n"),
     "",
-    `💡 Exemple : \`${prefix}2\` pour choisir le 2ᵉ destinataire.`,
-    `🛑 Pour annuler : \`${prefix}message annule\``
+    `💡 Exemple : \`${prefix}2\``,
+    `🛑 Annuler : \`${prefix}message annule\``
   ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// Commande !message
+// Sous-commandes
 // ---------------------------------------------------------------------------
 
 async function handleMessage(context = {}) {
@@ -309,10 +293,9 @@ async function handleMessage(context = {}) {
     return send(
       { api, message, event },
       `📨 **Commande message**\n\n` +
-      `Utilisation : \`${prefix}message <ton message>\`\n` +
-      `Puis choisis le destinataire en écrivant \`${prefix}1\`, \`${prefix}2\`…\n\n` +
-      `Pour lire tes messages : \`${prefix}voir\`\n` +
-      `Pour annuler : \`${prefix}message annule\``
+      `\`${prefix}message <ton message>\` puis \`${prefix}1\`, \`${prefix}2\`…\n` +
+      `\`${prefix}voir\` pour lire tes messages\n` +
+      `\`${prefix}message annule\` pour annuler`
     );
   }
 
@@ -343,10 +326,6 @@ async function handleMessage(context = {}) {
     `✍️ **Message enregistré :**\n« ${rawText.slice(0, 200)}${rawText.length > 200 ? "…" : ""} »\n\n${buildRecipientsText(prefix, recipients)}`
   );
 }
-
-// ---------------------------------------------------------------------------
-// Sélection par numéro : !1, !2, !3…
-// ---------------------------------------------------------------------------
 
 async function handleNumberSelection(context, index) {
   const { api, message, event, globalData } = context;
@@ -388,14 +367,11 @@ async function handleNumberSelection(context, index) {
     return { persist: "messages" };
   });
 
-  // Confirmation à l'expéditeur
   await send(
     { api, message, event },
-    `📨 **Message envoyé à ${target.name}** ✅\n\n` +
-    `Dès que ${target.name} écrira \`${prefix}voir\`, il/elle verra ton message.`
+    `📨 **Message envoyé à ${target.name}** ✅\n\nDès que ${target.name} écrira \`${prefix}voir\`, il/elle verra ton message.`
   );
 
-  // Notification : dans le groupe le plus actif du destinataire
   const activeThread = await getMostActiveThread(globalData, target.userID);
   const notifyThread = activeThread || getThreadID(event);
   const senderLabel = pending.fromName || "Quelqu’un";
@@ -406,8 +382,7 @@ async function handleNumberSelection(context, index) {
       notifyThread
     );
   } catch (error) {
-    console.warn("[Message] Notification impossible dans le groupe le plus actif :", error.message || error);
-    // Fallback dans le groupe courant
+    console.warn("[Message] notif :", error.message || error);
     try {
       await api.sendMessage(
         `🔔 ${target.name}, tu as reçu un message privé de ${senderLabel}. Écris \`${prefix}voir\` pour le consulter.`,
@@ -417,10 +392,6 @@ async function handleNumberSelection(context, index) {
   }
   return true;
 }
-
-// ---------------------------------------------------------------------------
-// Commande !voir
-// ---------------------------------------------------------------------------
 
 async function handleVoir(context = {}) {
   const { api, message, event, globalData } = context;
@@ -464,14 +435,9 @@ async function handleVoir(context = {}) {
   return send(
     { api, message, event },
     `📬 **Tes messages (${fresh.length}) :**\n\n${lines.join("\n\n")}\n\n` +
-    `✅ Ces messages sont maintenant marqués comme lus.\n` +
-    `Pour répondre : \`${prefix}message <ton texte>\` puis choisis le destinataire.`
+    `✅ Marques comme lus.\nPour répondre : \`${prefix}message <texte>\` puis \`${prefix}1\`, \`${prefix}2\`…`
   );
 }
-
-// ---------------------------------------------------------------------------
-// Détection
-// ---------------------------------------------------------------------------
 
 function invokedCommand(context) {
   const body = String(context.event && context.event.body || "").trim();
@@ -486,7 +452,7 @@ async function handleCommand(context = {}) {
   const prefix = getPrefix(context);
   const body = String(context.event && context.event.body || "").trim();
 
-  // Cas particulier : "!1", "!2"… pour choisir le destinataire
+  // !<nombre> (ex: !1, !2) → choix du destinataire
   const numericMatch = body.match(new RegExp(`^\\${prefix}\\s*(\\d+)\\s*$`));
   if (numericMatch) {
     return handleNumberSelection(context, parseInt(numericMatch[1], 10));
@@ -501,22 +467,16 @@ module.exports = {
   config: {
     name: "message",
     aliases: ["msg", "dm", "voir", "messages", "inbox"],
-    version: "2.0.0",
+    version: "3.0.0",
     author: "Diwate",
-    description: "Envoie un message privé à un utilisateur (choix par !1, !2…) et notifie dans son groupe le plus actif",
+    description: "Envoie un message privé (choix par !1, !2…) et notifie dans le groupe le plus actif du destinataire",
     category: "Social",
     usages: "message <texte> | <préfixe><numéro> | message annule | voir",
     role: 0
   },
-  STORAGE_KEY,
-  INDEX_KEY,
-  ACTIVITY_KEY,
-  MAX_MESSAGE_LENGTH,
-  trackActivity,
-  getMostActiveThread,
-  handleMessage,
-  handleNumberSelection,
-  handleVoir,
+  STORAGE_KEY, INDEX_KEY, ACTIVITY_KEY, MAX_MESSAGE_LENGTH,
+  trackActivity, getMostActiveThread, rememberUser,
+  handleMessage, handleNumberSelection, handleVoir,
   onStart: async function (context) {
     try {
       return await handleCommand(context);
