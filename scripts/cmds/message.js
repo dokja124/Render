@@ -2,15 +2,18 @@
 
 const { send } = require("./lib/messenger");
 
-const STORAGE_KEY = "privateMessagesV1";
-const INDEX_KEY = "privateMessagesIndexV1"; // liste des utilisateurs connus
+const STORAGE_KEY = "privateMessagesV2";
+const INDEX_KEY = "privateMessagesUsersV2";
+const ACTIVITY_KEY = "privateMessagesActivityV2"; // { userId: { threadID: count } }
 const MAX_MESSAGE_LENGTH = 1500;
 const MAX_INBOX = 50;
-const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 jours
+const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_USERS_CACHE = 500;
+const MAX_THREADS_PER_USER = 20;
 
-let store = null;          // { messageId: { from, fromName, to, text, at, read } }
-let knownUsers = null;     // { userId: { name, lastSeen } }
+let store = null;
+let knownUsers = null;
+let activity = null;
 let loadPromise = null;
 let mutationQueue = Promise.resolve();
 
@@ -21,7 +24,7 @@ let mutationQueue = Promise.resolve();
 function normalizeID(value) {
   if (value == null) return "";
   if (typeof value === "object") {
-    return String(value.id || value.userID || value.userId || value.senderID || value.author || "").trim();
+    return String(value.id || value.userID || value.userId || value.senderID || value.author || value.threadID || "").trim();
   }
   return String(value).trim();
 }
@@ -41,7 +44,9 @@ function getThreadID(event) {
 function getPrefix(context = {}) {
   if (context.prefix) return String(context.prefix);
   const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
-  return String(config.prefix || "!");
+  const p = config.prefix;
+  if (Array.isArray(p)) return String(p[0] || "!");
+  return String(p || "!");
 }
 
 function getOwnerIDs() {
@@ -63,18 +68,15 @@ function cleanName(value, fallback = "Utilisateur") {
 
 function getOwnerDisplayName() {
   const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
-  const configured = config.ownerName || config.botName || "Propriétaire";
-  return cleanName(configured, "Propriétaire");
+  return cleanName(config.ownerName || config.botName || "Propriétaire", "Propriétaire");
 }
 
 function formatDate(timestamp) {
   try {
-    const date = new Date(timestamp);
-    const pad = (n) => String(n).padStart(2, "0");
-    return `${pad(date.getDate())}/${pad(date.getMonth() + 1)}/${date.getFullYear()} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
-  } catch (_) {
-    return "date inconnue";
-  }
+    const d = new Date(timestamp);
+    const pad = n => String(n).padStart(2, "0");
+    return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  } catch (_) { return "date inconnue"; }
 }
 
 function makeMessageID() {
@@ -86,51 +88,42 @@ function makeMessageID() {
 // ---------------------------------------------------------------------------
 
 async function loadAll(globalData) {
-  if (store && knownUsers) return { store, knownUsers };
+  if (store && knownUsers && activity) return { store, knownUsers, activity };
   if (loadPromise) return loadPromise;
   loadPromise = (async () => {
     store = {};
     knownUsers = {};
+    activity = {};
     if (globalData && typeof globalData.get === "function") {
       try {
         const s = await globalData.get(STORAGE_KEY, "data", {});
         if (s && typeof s === "object" && !Array.isArray(s)) store = { ...s };
-      } catch (error) {
-        console.warn("[Message] Lecture messages impossible :", error.message || error);
-      }
+      } catch (e) { console.warn("[Message] Lecture messages :", e.message || e); }
       try {
         const u = await globalData.get(INDEX_KEY, "data", {});
         if (u && typeof u === "object" && !Array.isArray(u)) knownUsers = { ...u };
-      } catch (error) {
-        console.warn("[Message] Lecture utilisateurs impossible :", error.message || error);
-      }
+      } catch (e) { console.warn("[Message] Lecture users :", e.message || e); }
+      try {
+        const a = await globalData.get(ACTIVITY_KEY, "data", {});
+        if (a && typeof a === "object" && !Array.isArray(a)) activity = { ...a };
+      } catch (e) { console.warn("[Message] Lecture activity :", e.message || e); }
     }
-    // Purge des messages expirés
     const now = Date.now();
     for (const [id, msg] of Object.entries(store)) {
-      if (!msg || now - (msg.at || 0) > MESSAGE_TTL_MS) delete store[id];
+      if (!msg || (msg.at && now - msg.at > MESSAGE_TTL_MS)) delete store[id];
     }
-    return { store, knownUsers };
+    return { store, knownUsers, activity };
   })();
-  try {
-    return await loadPromise;
-  } finally {
-    loadPromise = null;
-  }
+  try { return await loadPromise; } finally { loadPromise = null; }
 }
 
 async function persist(globalData, which) {
   if (!globalData || typeof globalData.set !== "function") return;
   try {
-    if (which === "messages" || which === "all") {
-      await globalData.set(STORAGE_KEY, store, "data");
-    }
-    if (which === "users" || which === "all") {
-      await globalData.set(INDEX_KEY, knownUsers, "data");
-    }
-  } catch (error) {
-    console.warn("[Message] Sauvegarde impossible :", error.message || error);
-  }
+    if (which === "messages" || which === "all") await globalData.set(STORAGE_KEY, store, "data");
+    if (which === "users" || which === "all") await globalData.set(INDEX_KEY, knownUsers, "data");
+    if (which === "activity" || which === "all") await globalData.set(ACTIVITY_KEY, activity, "data");
+  } catch (e) { console.warn("[Message] Sauvegarde :", e.message || e); }
 }
 
 async function mutate(globalData, fn) {
@@ -148,7 +141,7 @@ async function mutate(globalData, fn) {
 async function rememberUser(globalData, userID, name) {
   const id = normalizeID(userID);
   if (!id) return;
-  const cleanN = cleanName(name, "Utilisateur");
+  const cleanN = cleanName(name);
   await mutate(globalData, () => {
     const existing = knownUsers[id];
     knownUsers[id] = {
@@ -156,11 +149,9 @@ async function rememberUser(globalData, userID, name) {
       lastSeen: Date.now(),
       isOwner: isOwner(id) || (existing && existing.isOwner) || false
     };
-    // Limite de taille
     const entries = Object.entries(knownUsers);
     if (entries.length > MAX_USERS_CACHE) {
-      entries
-        .sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0))
+      entries.sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0))
         .slice(MAX_USERS_CACHE)
         .forEach(([k]) => delete knownUsers[k]);
     }
@@ -169,47 +160,79 @@ async function rememberUser(globalData, userID, name) {
 }
 
 // ---------------------------------------------------------------------------
-// Résolution du pseudo d'un utilisateur
+// Suivi d'activité : à appeler à chaque message d'un utilisateur
+// ---------------------------------------------------------------------------
+
+/**
+ * Enregistre une activité dans le groupe courant.
+ * À appeler depuis onEvent.js (ou onChat) à chaque message.
+ */
+async function trackActivity(context = {}) {
+  const { event, globalData } = context;
+  const userID = getSenderID(event);
+  const threadID = getThreadID(event);
+  if (!userID || !threadID) return;
+
+  await loadAll(globalData);
+  await mutate(globalData, () => {
+    if (!activity[userID] || typeof activity[userID] !== "object") activity[userID] = {};
+    activity[userID][threadID] = (Number(activity[userID][threadID]) || 0) + 1;
+    const threads = Object.entries(activity[userID]);
+    if (threads.length > MAX_THREADS_PER_USER) {
+      threads.sort((a, b) => Number(b[1]) - Number(a[1]))
+        .slice(MAX_THREADS_PER_USER)
+        .forEach(([tid]) => delete activity[userID][tid]);
+    }
+    return { persist: "activity" };
+  });
+}
+
+/**
+ * Renvoie le threadID le plus actif pour un utilisateur, ou null.
+ */
+async function getMostActiveThread(globalData, userID) {
+  await loadAll(globalData);
+  const map = activity[normalizeID(userID)];
+  if (!map || typeof map !== "object") return null;
+  let best = null;
+  let bestCount = 0;
+  for (const [tid, count] of Object.entries(map)) {
+    const n = Number(count) || 0;
+    if (n > bestCount) { bestCount = n; best = tid; }
+  }
+  return best;
+}
+
+// ---------------------------------------------------------------------------
+// Résolution du pseudo
 // ---------------------------------------------------------------------------
 
 async function resolveDisplayName(context, userID) {
   const id = normalizeID(userID);
   if (!id) return "Utilisateur";
-
-  // Owner ?
   if (isOwner(id)) return getOwnerDisplayName();
 
-  // Déjà connu ?
   await loadAll(context.globalData);
   if (knownUsers[id] && knownUsers[id].name) return knownUsers[id].name;
 
-  // Recherche usersData
   const usersData = context.usersData;
   if (usersData && typeof usersData.get === "function") {
     try {
       const p = await usersData.get(id);
       const name = typeof p === "string" ? p : p && (p.name || p.fullName || p.nickname || p.firstName);
-      if (name) return cleanName(name, "Utilisateur");
+      if (name) return cleanName(name);
     } catch (_) {}
   }
 
-  // Recherche via event
-  const event = context.event;
-  if (event && normalizeID(event.senderID) === id && event.senderName) {
-    return cleanName(event.senderName, "Utilisateur");
-  }
-
-  // Recherche via api.getUserInfo
   const api = context.api;
   if (api && typeof api.getUserInfo === "function") {
     try {
       const profiles = await api.getUserInfo([id]);
       const p = profiles && (profiles[id] || profiles[Number(id)]);
       const name = p && (p.name || p.firstName);
-      if (name) return cleanName(name, "Utilisateur");
+      if (name) return cleanName(name);
     } catch (_) {}
   }
-
   return `Utilisateur ${id.slice(-4)}`;
 }
 
@@ -225,16 +248,12 @@ async function buildRecipientsList(context) {
   const list = [];
   const seen = new Set();
 
-  // 1. Propriétaire en tête
-  const owners = getOwnerIDs();
-  for (const ownerID of owners) {
-    if (ownerID === senderID) continue;
-    if (seen.has(ownerID)) continue;
+  for (const ownerID of getOwnerIDs()) {
+    if (ownerID === senderID || seen.has(ownerID)) continue;
     seen.add(ownerID);
     list.push({ userID: ownerID, name: getOwnerDisplayName(), isOwner: true });
   }
 
-  // 2. Utilisateurs connus (hors sender)
   const known = Object.entries(knownUsers)
     .filter(([id]) => id !== senderID && !seen.has(id))
     .sort((a, b) => (b[1].lastSeen || 0) - (a[1].lastSeen || 0));
@@ -243,27 +262,23 @@ async function buildRecipientsList(context) {
     list.push({ userID: id, name: info.name || `Utilisateur ${id.slice(-4)}`, isOwner: isOwner(id) });
     if (list.length >= 20) break;
   }
-
   return list;
 }
 
 function buildRecipientsText(prefix, list) {
-  const lines = list.map((r, i) => {
-    const tag = r.isOwner ? " 👑" : "";
-    return `${i + 1}. ${r.name}${tag}`;
-  });
+  const lines = list.map((r, i) => `${i + 1}. ${r.name}${r.isOwner ? " 👑" : ""}`);
   return [
-    `📬 **Choisis le destinataire** en répondant par son numéro :`,
+    `📬 **Choisis le destinataire** en écrivant \`${prefix}1\`, \`${prefix}2\`, \`${prefix}3\`…`,
     "",
     lines.join("\n"),
     "",
-    `💡 Exemple : \`${prefix}message 1\``,
+    `💡 Exemple : \`${prefix}2\` pour choisir le 2ᵉ destinataire.`,
     `🛑 Pour annuler : \`${prefix}message annule\``
   ].join("\n");
 }
 
 // ---------------------------------------------------------------------------
-// Commande principale
+// Commande !message
 // ---------------------------------------------------------------------------
 
 async function handleMessage(context = {}) {
@@ -275,55 +290,41 @@ async function handleMessage(context = {}) {
 
   if (!senderID) return send({ api, message, event }, "❌ Impossible d’identifier ton compte.");
 
-  // Extraction du texte après "!message"
   const afterCommand = body.replace(/^[^\s]+\s*/, "").trim();
   const rawText = args.length ? args.join(" ").trim() : afterCommand;
-
-  // ===== Cas 1 : sous-commande "annule" ou "cancel" =====
   const firstWord = normalize(rawText.split(/\s+/)[0] || "");
+
   if (["annule", "annuler", "cancel", "stop"].includes(firstWord)) {
+    await mutate(globalData, () => {
+      delete store[`pending_${senderID}`];
+      return { persist: "messages" };
+    });
     return send({ api, message, event }, "🛑 Envoi de message annulé.");
   }
 
-  // ===== Cas 2 : réponse par un numéro (choix du destinataire) =====
-  if (/^\d+$/.test(rawText) && context.messageSession) {
-    return finalizeSend(context, parseInt(rawText, 10));
-  }
-
-  // On mémorise l'utilisateur courant (pseudo)
   const senderName = await resolveDisplayName(context, senderID);
   await rememberUser(globalData, senderID, senderName);
 
-  // ===== Cas 3 : texte vide → aide =====
   if (!rawText) {
     return send(
       { api, message, event },
       `📨 **Commande message**\n\n` +
       `Utilisation : \`${prefix}message <ton message>\`\n` +
-      `Puis choisis le destinataire dans la liste.\n\n` +
-      `Pour lire tes messages reçus : \`${prefix}voir\`\n` +
+      `Puis choisis le destinataire en écrivant \`${prefix}1\`, \`${prefix}2\`…\n\n` +
+      `Pour lire tes messages : \`${prefix}voir\`\n` +
       `Pour annuler : \`${prefix}message annule\``
     );
   }
 
-  // ===== Cas 4 : texte trop long =====
   if (rawText.length > MAX_MESSAGE_LENGTH) {
-    return send(
-      { api, message, event },
-      `❌ Ton message dépasse **${MAX_MESSAGE_LENGTH} caractères** (actuellement ${rawText.length}). Raccourcis-le et réessaie.`
-    );
+    return send({ api, message, event }, `❌ Message trop long (${rawText.length}). Limite : ${MAX_MESSAGE_LENGTH}.`);
   }
 
-  // ===== Cas 5 : stocker le message en attente et demander le destinataire =====
   const recipients = await buildRecipientsList(context);
   if (recipients.length === 0) {
-    return send(
-      { api, message, event },
-      `⚠️ Aucun autre utilisateur connu pour le moment. Attends que d’autres personnes utilisent le bot, puis réessaie.`
-    );
+    return send({ api, message, event }, "⚠️ Aucun autre utilisateur connu. Attends que d’autres personnes utilisent le bot.");
   }
 
-  // Stocker dans une session "pending" par sender+thread
   await mutate(globalData, () => {
     store[`pending_${senderID}`] = {
       type: "pending",
@@ -344,13 +345,15 @@ async function handleMessage(context = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Finalisation : choisir le destinataire et envoyer la notification
+// Sélection par numéro : !1, !2, !3…
 // ---------------------------------------------------------------------------
 
-async function finalizeSend(context, index) {
+async function handleNumberSelection(context, index) {
   const { api, message, event, globalData } = context;
   const prefix = getPrefix(context);
   const senderID = getSenderID(event);
+
+  await loadAll(globalData);
   const pending = store[`pending_${senderID}`];
 
   if (!pending || pending.type !== "pending") {
@@ -368,11 +371,11 @@ async function finalizeSend(context, index) {
 
   await mutate(globalData, () => {
     delete store[`pending_${senderID}`];
-    const inbox = store[target.userID] && typeof store[target.userID] === "object" && !store[target.userID].type
+    const box = store[target.userID] && typeof store[target.userID] === "object" && !store[target.userID].type
       ? store[target.userID]
       : { inbox: [] };
-    if (!Array.isArray(inbox.inbox)) inbox.inbox = [];
-    inbox.inbox.push({
+    if (!Array.isArray(box.inbox)) box.inbox = [];
+    box.inbox.push({
       id: messageID,
       from: senderID,
       fromName: pending.fromName,
@@ -380,34 +383,43 @@ async function finalizeSend(context, index) {
       at: now,
       read: false
     });
-    if (inbox.inbox.length > MAX_INBOX) inbox.inbox = inbox.inbox.slice(-MAX_INBOX);
-    store[target.userID] = inbox;
+    if (box.inbox.length > MAX_INBOX) box.inbox = box.inbox.slice(-MAX_INBOX);
+    store[target.userID] = box;
     return { persist: "messages" };
   });
 
-  // Notification au destinataire dans le thread courant
-  const senderLabel = pending.fromName || "Quelqu’un";
+  // Confirmation à l'expéditeur
   await send(
     { api, message, event },
     `📨 **Message envoyé à ${target.name}** ✅\n\n` +
     `Dès que ${target.name} écrira \`${prefix}voir\`, il/elle verra ton message.`
   );
 
-  // Petit message "notification" affiché dans le groupe pour rappeler au destinataire (optionnel)
-  try {
-    await send(
-      { api, message, event },
-      `🔔 ${target.name}, tu as reçu un message privé de ${senderLabel}. Écris \`${prefix}voir\` pour le consulter.`
-    );
-  } catch (_) {
-    // Certaines versions de Messenger limitent l'envoi de mentions non sollicitées
-  }
+  // Notification : dans le groupe le plus actif du destinataire
+  const activeThread = await getMostActiveThread(globalData, target.userID);
+  const notifyThread = activeThread || getThreadID(event);
+  const senderLabel = pending.fromName || "Quelqu’un";
 
+  try {
+    await api.sendMessage(
+      `🔔 ${target.name}, tu as reçu un message privé de ${senderLabel}. Écris \`${prefix}voir\` pour le consulter.`,
+      notifyThread
+    );
+  } catch (error) {
+    console.warn("[Message] Notification impossible dans le groupe le plus actif :", error.message || error);
+    // Fallback dans le groupe courant
+    try {
+      await api.sendMessage(
+        `🔔 ${target.name}, tu as reçu un message privé de ${senderLabel}. Écris \`${prefix}voir\` pour le consulter.`,
+        getThreadID(event)
+      );
+    } catch (_) {}
+  }
   return true;
 }
 
 // ---------------------------------------------------------------------------
-// Commande "voir"
+// Commande !voir
 // ---------------------------------------------------------------------------
 
 async function handleVoir(context = {}) {
@@ -419,7 +431,7 @@ async function handleVoir(context = {}) {
   await loadAll(globalData);
   const box = store[userID];
   if (!box || !Array.isArray(box.inbox) || box.inbox.length === 0) {
-    return send({ api, message, event }, `📭 Aucun message reçu pour le moment.\n\n💡 Quand quelqu’un t’enverra un message, reviens avec \`${prefix}voir\`.`);
+    return send({ api, message, event }, `📭 Aucun message reçu.\n\n💡 Quand quelqu’un t’écrira, reviens avec \`${prefix}voir\`.`);
   }
 
   const now = Date.now();
@@ -429,20 +441,20 @@ async function handleVoir(context = {}) {
       store[userID] = { inbox: [] };
       return { persist: "messages" };
     });
-    return send({ api, message, event }, `📭 Tous tes messages ont expiré (plus de 7 jours).`);
+    return send({ api, message, event }, "📭 Tous tes messages ont expiré (plus de 7 jours).");
   }
 
   const lines = fresh.map((m, i) => {
     const status = m.read ? "✔️ lu" : "🆕 non lu";
+    const preview = String(m.text).slice(0, 500);
     return [
       `**${i + 1}.** ${status}`,
       `👤 De : ${m.fromName || "Utilisateur"}`,
       `🕐 ${formatDate(m.at)}`,
-      `💬 « ${String(m.text).slice(0, 500)}${String(m.text).length > 500 ? "…" : ""} »`
+      `💬 « ${preview}${String(m.text).length > 500 ? "…" : ""} »`
     ].join("\n");
   });
 
-  // Marquer comme lus
   await mutate(globalData, () => {
     for (const m of fresh) m.read = true;
     store[userID] = { inbox: fresh };
@@ -458,12 +470,11 @@ async function handleVoir(context = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Détection de la commande réellement invoquée
+// Détection
 // ---------------------------------------------------------------------------
 
 function invokedCommand(context) {
-  const event = context.event || {};
-  const body = String(event.body || "").trim();
+  const body = String(context.event && context.event.body || "").trim();
   const firstToken = body.split(/\s+/)[0] || "";
   const raw = normalize(firstToken.replace(/^[^A-Za-z0-9]+/, ""));
   if (raw === "voir" || raw === "messages" || raw === "inbox") return "voir";
@@ -472,6 +483,15 @@ function invokedCommand(context) {
 }
 
 async function handleCommand(context = {}) {
+  const prefix = getPrefix(context);
+  const body = String(context.event && context.event.body || "").trim();
+
+  // Cas particulier : "!1", "!2"… pour choisir le destinataire
+  const numericMatch = body.match(new RegExp(`^\\${prefix}\\s*(\\d+)\\s*$`));
+  if (numericMatch) {
+    return handleNumberSelection(context, parseInt(numericMatch[1], 10));
+  }
+
   const invoked = invokedCommand(context);
   if (invoked === "voir") return handleVoir(context);
   return handleMessage(context);
@@ -481,17 +501,21 @@ module.exports = {
   config: {
     name: "message",
     aliases: ["msg", "dm", "voir", "messages", "inbox"],
-    version: "1.0.0",
+    version: "2.0.0",
     author: "Diwate",
-    description: "Envoie un message privé à un autre utilisateur du bot via une liste numérotée",
+    description: "Envoie un message privé à un utilisateur (choix par !1, !2…) et notifie dans son groupe le plus actif",
     category: "Social",
-    usages: "message <texte> | message <numéro> | message annule | voir",
+    usages: "message <texte> | <préfixe><numéro> | message annule | voir",
     role: 0
   },
   STORAGE_KEY,
   INDEX_KEY,
+  ACTIVITY_KEY,
   MAX_MESSAGE_LENGTH,
+  trackActivity,
+  getMostActiveThread,
   handleMessage,
+  handleNumberSelection,
   handleVoir,
   onStart: async function (context) {
     try {
