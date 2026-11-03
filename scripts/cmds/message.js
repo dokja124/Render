@@ -288,7 +288,6 @@ async function findTargetByName(context, nameToFind) {
     }
   }
 
-  // On trie pour mettre les correspondances exactes en premier
   return matches.sort((a, b) => b.exact - a.exact);
 }
 
@@ -393,12 +392,14 @@ async function handleMessage(context = {}) {
         targetID = matches[0].userID;
         finalText = extractedText;
       } else if (matches.length > 1) {
-        // Plusieurs correspondances : on sauvegarde le message et on demande de choisir
+        // CORRECTION DE L'ERREUR ICI : on résout le nom AVANT le mutate
+        const senderName = await resolveDisplayName(context, senderID);
+        
         await mutate(globalData, () => {
           store[`pending_${senderID}`] = {
             type: "pending",
             from: senderID,
-            fromName: await resolveDisplayName(context, senderID),
+            fromName: senderName, // Pas de await ici !
             threadID: getThreadID(event),
             text: extractedText,
             at: Date.now(),
@@ -608,7 +609,7 @@ module.exports = {
   config: {
     name: "message",
     aliases: ["msg", "dm", "voir", "messages", "inbox", "choisir", "select"],
-    version: "6.0.0",
+    version: "6.1.0",
     author: "Diwate",
     description: "Envoie un message privé (syntaxe : !message <texte> à <pseudo>)",
     category: "Social",
