@@ -10,6 +10,7 @@ const MAX_INBOX = 50;
 const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECIPIENTS_PER_PAGE = 20;
 const MAX_THREADS_PER_USER = 20;
+const MAX_NOTIFICATIONS = 5; // Éviter de spammer si l'utilisateur est dans 50 groupes
 
 let store = null;
 let knownUsers = null;
@@ -92,6 +93,10 @@ function formatDate(ts) {
 
 function makeMessageID() {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // ---------------------------------------------------------------------------
@@ -250,16 +255,19 @@ async function trackActivity(context = {}) {
   });
 }
 
-async function getMostActiveThread(globalData, userID) {
+// ---------------------------------------------------------------------------
+// Récupération des groupes d'un utilisateur
+// ---------------------------------------------------------------------------
+
+async function getAllActiveThreads(globalData, userID) {
   await loadAll(globalData);
   const map = activity[normalizeID(userID)];
-  if (!map || typeof map !== "object") return null;
-  let best = null, bestCount = 0;
-  for (const [tid, count] of Object.entries(map)) {
-    const n = Number(count) || 0;
-    if (n > bestCount) { bestCount = n; best = tid; }
-  }
-  return best;
+  if (!map || typeof map !== "object") return [];
+  
+  // On trie par nombre de messages décroissant, et on renvoie les IDs des threads
+  return Object.entries(map)
+    .sort((a, b) => (Number(b[1]) || 0) - (Number(a[1]) || 0))
+    .map(([tid]) => tid);
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +315,41 @@ function buildRecipientsText(prefix, list, requestedPage = 1) {
 }
 
 // ---------------------------------------------------------------------------
+// Envoi de la notification dans plusieurs groupes
+// ---------------------------------------------------------------------------
+
+async function sendNotificationsToUserGroups(context, targetID, targetName, senderName, prefix, fallbackThread) {
+  const { api, globalData } = context;
+  
+  let threadsToNotify = await getAllActiveThreads(globalData, targetID);
+  
+  // Si on n'a aucun groupe enregistré pour lui, on utilise le groupe courant
+  if (threadsToNotify.length === 0) {
+    threadsToNotify = [fallbackThread];
+  } else {
+    // S'assurer que le groupe courant est inclus s'il n'y est pas
+    if (!threadsToNotify.includes(fallbackThread)) {
+      threadsToNotify.push(fallbackThread);
+    }
+    // Limiter pour éviter le spam / rate limit
+    threadsToNotify = threadsToNotify.slice(0, MAX_NOTIFICATIONS);
+  }
+
+  const notificationText = `🔔 **Notification privée**\n${targetName}, tu as reçu un message privé de ${senderName}. Écris \`${prefix}voir\` dans ce groupe pour le consulter.`;
+
+  for (const threadID of threadsToNotify) {
+    try {
+      await api.sendMessage(notificationText, threadID);
+      // Petit délai pour éviter que Facebook ne considère ça comme du spam
+      await sleep(800); 
+    } catch (error) {
+      // On ignore l'erreur si le bot n'est plus dans le groupe ou n'a pas la permission
+      console.warn(`[Message] Impossible de notifier dans le groupe ${threadID}:`, error.message || error);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Sous-commandes
 // ---------------------------------------------------------------------------
 
@@ -319,7 +362,6 @@ async function handleMessage(context = {}) {
 
   if (!senderID) return send({ api, message, event }, "❌ Impossible d’identifier ton compte.");
 
-  // Enregistrer l'expéditeur (tracking)
   await trackActivity(context);
 
   let rawText = args.length ? args.join(" ").trim() : body.replace(/^[^\s]+\s*/, "").trim();
@@ -351,22 +393,18 @@ async function handleMessage(context = {}) {
   let targetID = null;
   let finalText = rawText;
 
-  // 1. Vérifier si c'est une réponse à un message
   const reply = event.messageReply || event.repliedMessage;
   if (reply && reply.senderID && String(reply.senderID) !== senderID) {
     targetID = String(reply.senderID);
   }
 
-  // 2. Vérifier s'il y a une mention (@Daniel)
   if (!targetID && event.mentions && Object.keys(event.mentions).length > 0) {
     targetID = Object.keys(event.mentions)[0];
-    // Nettoyer la mention du texte
     const mentionName = event.mentions[targetID];
     finalText = finalText.replace(new RegExp(`@${mentionName}`, 'gi'), '').replace(new RegExp(mentionName, 'gi'), '').trim();
     if (!finalText) finalText = rawText;
   }
 
-  // 3. Analyser le texte pour trouver "à <pseudo>", "pour <pseudo>" ou le dernier mot
   if (!targetID) {
     let pseudoQuery = null;
     let extractedText = rawText;
@@ -378,7 +416,6 @@ async function handleMessage(context = {}) {
       pseudoQuery = matchA[1].trim();
       extractedText = rawText.substring(0, matchA.index).trim();
     } else {
-      // Tenter de prendre le dernier mot comme pseudo
       const words = rawText.split(/\s+/);
       if (words.length > 1) {
         pseudoQuery = words[words.length - 1];
@@ -392,14 +429,12 @@ async function handleMessage(context = {}) {
         targetID = matches[0].userID;
         finalText = extractedText;
       } else if (matches.length > 1) {
-        // CORRECTION DE L'ERREUR ICI : on résout le nom AVANT le mutate
         const senderName = await resolveDisplayName(context, senderID);
-        
         await mutate(globalData, () => {
           store[`pending_${senderID}`] = {
             type: "pending",
             from: senderID,
-            fromName: senderName, // Pas de await ici !
+            fromName: senderName,
             threadID: getThreadID(event),
             text: extractedText,
             at: Date.now(),
@@ -414,12 +449,10 @@ async function handleMessage(context = {}) {
     }
   }
 
-  // Si toujours pas de destinataire identifié
   if (!targetID) {
     return send({ api, message, event }, `❓ Je ne sais pas à qui envoyer ce message.\nRéponds à son message avec \`${prefix}message <texte>\` ou précise \`${prefix}message <texte> à <pseudo>\`.`);
   }
 
-  // Envoi final
   const targetName = await resolveDisplayName(context, targetID);
   const senderName = await resolveDisplayName(context, senderID);
   const messageID = makeMessageID();
@@ -448,23 +481,9 @@ async function handleMessage(context = {}) {
     `📨 **Message envoyé à ${targetName}** ✅\n\nDès que ${targetName} écrira \`${prefix}voir\`, il/elle verra ton message.`
   );
 
-  // Notification dans le groupe le plus actif
-  const activeThread = await getMostActiveThread(globalData, targetID);
-  const notifyThread = activeThread || getThreadID(event);
+  // Envoi des notifications dans les groupes du destinataire
+  await sendNotificationsToUserGroups(context, targetID, targetName, senderName, prefix, getThreadID(event));
 
-  try {
-    await api.sendMessage(
-      `🔔 ${targetName}, tu as reçu un message privé de ${senderName}. Écris \`${prefix}voir\` pour le consulter.`,
-      notifyThread
-    );
-  } catch (error) {
-    try {
-      await api.sendMessage(
-        `🔔 ${targetName}, tu as reçu un message privé de ${senderName}. Écris \`${prefix}voir\` pour le consulter.`,
-        getThreadID(event)
-      );
-    } catch (_) {}
-  }
   return true;
 }
 
@@ -513,22 +532,9 @@ async function handleNumberSelection(context, index) {
     `📨 **Message envoyé à ${target.name}** ✅\n\nDès que ${target.name} écrira \`${prefix}voir\`, il/elle verra ton message.`
   );
 
-  const activeThread = await getMostActiveThread(globalData, target.userID);
-  const notifyThread = activeThread || getThreadID(event);
+  // Envoi des notifications dans les groupes du destinataire
+  await sendNotificationsToUserGroups(context, target.userID, target.name, pending.fromName, prefix, getThreadID(event));
 
-  try {
-    await api.sendMessage(
-      `🔔 ${target.name}, tu as reçu un message privé de ${pending.fromName}. Écris \`${prefix}voir\` pour le consulter.`,
-      notifyThread
-    );
-  } catch (error) {
-    try {
-      await api.sendMessage(
-        `🔔 ${target.name}, tu as reçu un message privé de ${pending.fromName}. Écris \`${prefix}voir\` pour le consulter.`,
-        getThreadID(event)
-      );
-    } catch (_) {}
-  }
   return true;
 }
 
@@ -609,7 +615,7 @@ module.exports = {
   config: {
     name: "message",
     aliases: ["msg", "dm", "voir", "messages", "inbox", "choisir", "select"],
-    version: "6.1.0",
+    version: "6.2.0",
     author: "Diwate",
     description: "Envoie un message privé (syntaxe : !message <texte> à <pseudo>)",
     category: "Social",
