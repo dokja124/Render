@@ -8,7 +8,7 @@ const ACTIVITY_KEY = "privateMessagesActivityV5";
 const MAX_MESSAGE_LENGTH = 1500;
 const MAX_INBOX = 50;
 const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const MAX_RECIPIENTS = 20;
+const RECIPIENTS_PER_PAGE = 20;
 const MAX_THREADS_PER_USER = 20;
 
 let store = null;
@@ -16,6 +16,9 @@ let knownUsers = null;
 let activity = null;
 let loadPromise = null;
 let mutationQueue = Promise.resolve();
+const MAX_TRACKED_EVENT_IDS = 1000;
+const RECENT_ACTIVITY_EVENT_IDS = new Map();
+const RECENT_ACTIVITY_EVENT_OBJECTS = new WeakSet();
 
 // ---------------------------------------------------------------------------
 // Utilitaires
@@ -62,8 +65,18 @@ function isOwner(userID) {
 }
 
 function cleanName(value, fallback = "Utilisateur") {
-  const name = String(value || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
-  return name && !/^\d+$/.test(name) ? name.slice(0, 50) : fallback;
+  const name = String(value == null ? "" : value)
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u202a-\u202e\u2060\ufeff]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!name || /^\d+$/.test(name) || /^(?:undefined|null|\[object object\])$/i.test(name)) return fallback;
+  return Array.from(name).slice(0, 50).join("");
+}
+
+function extractProfileName(profile) {
+  if (typeof profile === "string") return cleanName(profile, "");
+  if (!profile || typeof profile !== "object") return "";
+  return cleanName(profile.name || profile.fullName || profile.displayName || profile.nickname || profile.firstName, "");
 }
 
 function getOwnerDisplayName() {
@@ -95,10 +108,16 @@ async function loadAll(globalData) {
     knownUsers = {};
     activity = {};
     if (globalData && typeof globalData.get === "function") {
-      try { store = (await globalData.get(STORAGE_KEY, "data", {})) || {}; } catch (e) {}
-      try { knownUsers = (await globalData.get(INDEX_KEY, "data", {})) || {}; } catch (e) {}
-      try { activity = (await globalData.get(ACTIVITY_KEY, "data", {})) || {}; } catch (e) {}
+      await ensureGlobalDataKey(globalData, STORAGE_KEY, {});
+      await ensureGlobalDataKey(globalData, INDEX_KEY, {});
+      await ensureGlobalDataKey(globalData, ACTIVITY_KEY, {});
+      try { store = (await globalData.get(STORAGE_KEY, "data", {})) || {}; } catch (e) { console.warn("[Message] Lecture du stockage des messages impossible :", e.message || e); }
+      try { knownUsers = (await globalData.get(INDEX_KEY, "data", {})) || {}; } catch (e) { console.warn("[Message] Lecture de l’index utilisateurs impossible :", e.message || e); }
+      try { activity = (await globalData.get(ACTIVITY_KEY, "data", {})) || {}; } catch (e) { console.warn("[Message] Lecture de l’activité impossible :", e.message || e); }
     }
+    if (!store || typeof store !== "object" || Array.isArray(store)) store = {};
+    if (!knownUsers || typeof knownUsers !== "object" || Array.isArray(knownUsers)) knownUsers = {};
+    if (!activity || typeof activity !== "object" || Array.isArray(activity)) activity = {};
     const now = Date.now();
     for (const [id, msg] of Object.entries(store)) {
       if (!msg || (msg.at && now - msg.at > MESSAGE_TTL_MS)) delete store[id];
@@ -108,13 +127,24 @@ async function loadAll(globalData) {
   try { return await loadPromise; } finally { loadPromise = null; }
 }
 
+async function ensureGlobalDataKey(globalData, key, initialData) {
+  if (!globalData || typeof globalData.create !== "function") return;
+  try {
+    if (typeof globalData.existsSync === "function" && globalData.existsSync(key)) return;
+    await globalData.create(key, { data: initialData });
+  } catch (error) {
+    if (error && (error.name === "KEY_EXISTS" || error.code === "KEY_EXISTS")) return;
+    console.warn(`[Message] Création du stockage ${key} impossible :`, error && (error.message || error));
+  }
+}
+
 async function persist(globalData, which) {
   if (!globalData || typeof globalData.set !== "function") return;
   try {
     if (which === "messages" || which === "all") await globalData.set(STORAGE_KEY, store, "data");
     if (which === "users" || which === "all") await globalData.set(INDEX_KEY, knownUsers, "data");
     if (which === "activity" || which === "all") await globalData.set(ACTIVITY_KEY, activity, "data");
-  } catch (e) {}
+  } catch (e) { console.warn("[Message] Échec de sauvegarde persistante :", e && (e.message || e)); }
 }
 
 async function mutate(globalData, fn) {
@@ -139,14 +169,13 @@ async function resolveDisplayName(context, userID) {
   if (isOwner(id)) return getOwnerDisplayName();
 
   await loadAll(context.globalData);
-  if (knownUsers[id] && knownUsers[id].name) return knownUsers[id].name;
 
   const usersData = context.usersData;
   if (usersData && typeof usersData.get === "function") {
     try {
       const p = await usersData.get(id);
-      const name = typeof p === "string" ? p : p && (p.name || p.fullName || p.nickname || p.firstName);
-      if (name) return cleanName(name);
+      const name = extractProfileName(p);
+      if (name) return name;
     } catch (_) {}
   }
 
@@ -155,10 +184,11 @@ async function resolveDisplayName(context, userID) {
     try {
       const profiles = await api.getUserInfo([id]);
       const p = profiles && (profiles[id] || profiles[Number(id)]);
-      const name = p && (p.name || p.firstName);
-      if (name) return cleanName(name);
+      const name = extractProfileName(p);
+      if (name) return name;
     } catch (_) {}
   }
+  if (knownUsers[id] && knownUsers[id].name) return cleanName(knownUsers[id].name, `Utilisateur ${id.slice(-4)}`);
   return `Utilisateur ${id.slice(-4)}`;
 }
 
@@ -168,52 +198,41 @@ async function resolveDisplayName(context, userID) {
 
 async function getAllUsersFromGoatBot(context) {
   const result = new Map();
+  const add = (idValue, profile) => {
+    const id = normalizeID(idValue);
+    if (!id) return;
+    const name = extractProfileName(profile);
+    const fallback = `Utilisateur ${id.slice(-4)}`;
+    if (!result.has(id) || (result.get(id) === fallback && name)) result.set(id, name || fallback);
+  };
+  const addList = list => {
+    if (!Array.isArray(list)) return;
+    for (const user of list) {
+      const id = normalizeID(user && (user.userID || user.userId || user.id));
+      add(id, user);
+    }
+  };
 
-  // Méthode 1 : usersData.getAll() (méthode moderne GoatBot)
+  // Source canonique : la base des fiches utilisateurs du bot.
   const usersData = context.usersData || (global.GoatBot && global.GoatBot.usersData);
   if (usersData && typeof usersData.getAll === "function") {
     try {
-      const list = await usersData.getAll();
-      if (Array.isArray(list)) {
-        for (const user of list) {
-          const id = normalizeID(user && (user.userID || user.userId || user.id));
-          const name = user && (user.name || user.fullName || user.nickname || user.firstName);
-          if (id) result.set(id, cleanName(name, `Utilisateur ${id.slice(-4)}`));
-        }
-      }
+      addList(await usersData.getAll());
     } catch (e) {
       console.warn("[Message] usersData.getAll a échoué :", e.message || e);
     }
   }
 
-  // Méthode 2 : global.db.allUserData
-  if (result.size === 0 && global.db && Array.isArray(global.db.allUserData)) {
-    for (const user of global.db.allUserData) {
-      const id = normalizeID(user && (user.userID || user.userId || user.id));
-      const name = user && (user.name || user.fullName || user.nickname || user.firstName);
-      if (id) result.set(id, cleanName(name, `Utilisateur ${id.slice(-4)}`));
-    }
-  }
+  // Sources de secours : elles complètent aussi une liste partielle de getAll().
+  if (global.db && Array.isArray(global.db.allUserData)) addList(global.db.allUserData);
+  if (global.GoatBot && Array.isArray(global.GoatBot.allUserData)) addList(global.GoatBot.allUserData);
 
-  // Méthode 3 : global.GoatBot.allUserData
-  if (result.size === 0 && global.GoatBot && Array.isArray(global.GoatBot.allUserData)) {
-    for (const user of global.GoatBot.allUserData) {
-      const id = normalizeID(user && (user.userID || user.userId || user.id));
-      const name = user && (user.name || user.fullName || user.nickname || user.firstName);
-      if (id) result.set(id, cleanName(name, `Utilisateur ${id.slice(-4)}`));
-    }
-  }
-
-  // Méthode 4 : global.GoatBot.users (Map)
-  if (result.size === 0 && global.GoatBot && global.GoatBot.users instanceof Map) {
+  if (global.GoatBot && global.GoatBot.users instanceof Map) {
     for (const [id, user] of global.GoatBot.users.entries()) {
-      const uid = normalizeID(id);
-      const name = user && (user.name || user.fullName);
-      if (uid) result.set(uid, cleanName(name, `Utilisateur ${uid.slice(-4)}`));
+      add(id, user);
     }
   }
 
-  console.log(`[Message] ${result.size} utilisateur(s) trouvé(s) dans GoatBot.`);
   return Array.from(result.entries()).map(([userID, name]) => ({ userID, name }));
 }
 
@@ -223,9 +242,25 @@ async function getAllUsersFromGoatBot(context) {
 
 async function trackActivity(context = {}) {
   const { event, globalData } = context;
+  const eventType = String(event && event.type || "").toLowerCase();
+  if (eventType && eventType !== "message" && eventType !== "message_reply") return;
   const userID = getSenderID(event);
   const threadID = getThreadID(event);
   if (!userID || !threadID) return;
+
+  const rawMessageID = normalizeID(event && (event.messageID || event.messageId));
+  const activityEventID = rawMessageID ? `${threadID}:${rawMessageID}` : "";
+  if (activityEventID && RECENT_ACTIVITY_EVENT_IDS.has(activityEventID)) return;
+  if (!activityEventID && event && typeof event === "object") {
+    if (RECENT_ACTIVITY_EVENT_OBJECTS.has(event)) return;
+    RECENT_ACTIVITY_EVENT_OBJECTS.add(event);
+  }
+  if (activityEventID) {
+    RECENT_ACTIVITY_EVENT_IDS.set(activityEventID, Date.now());
+    while (RECENT_ACTIVITY_EVENT_IDS.size > MAX_TRACKED_EVENT_IDS) {
+      RECENT_ACTIVITY_EVENT_IDS.delete(RECENT_ACTIVITY_EVENT_IDS.keys().next().value);
+    }
+  }
 
   await loadAll(globalData);
   await mutate(globalData, () => {
@@ -273,7 +308,7 @@ async function buildRecipientsList(context) {
   const merged = new Map();
   for (const u of goatUsers) merged.set(u.userID, u.name);
   for (const [id, info] of Object.entries(knownUsers)) {
-    if (info && info.name) merged.set(id, info.name);
+    if (info && info.name && !merged.has(id)) merged.set(id, cleanName(info.name, `Utilisateur ${id.slice(-4)}`));
   }
 
   const list = [];
@@ -295,24 +330,26 @@ async function buildRecipientsList(context) {
     }))
     .sort((a, b) => b.lastSeen - a.lastSeen || a.name.localeCompare(b.name, "fr"));
 
-  for (const u of others) {
-    if (list.length >= MAX_RECIPIENTS) break;
-    list.push({ userID: u.userID, name: u.name, isOwner: u.isOwner });
-  }
+  for (const u of others) list.push({ userID: u.userID, name: u.name, isOwner: u.isOwner });
 
   return list;
 }
 
-function buildRecipientsText(prefix, list) {
-  const lines = list.map((r, i) => `${i + 1}. ${r.name}${r.isOwner ? " 👑" : ""}`);
+function buildRecipientsText(prefix, list, requestedPage = 1) {
+  const pageSize = RECIPIENTS_PER_PAGE;
+  const pageCount = Math.max(1, Math.ceil(list.length / pageSize));
+  const page = Math.max(1, Math.min(pageCount, Math.floor(Number(requestedPage) || 1)));
+  const start = (page - 1) * pageSize;
+  const lines = list.slice(start, start + pageSize).map((r, i) => `${start + i + 1}. ${r.name}${r.isOwner ? " 👑" : ""}`);
   return [
     `📬 **Choisis le destinataire** en écrivant \`${prefix}choisir <numéro>\`.`,
     "",
     lines.join("\n"),
     "",
-    `💡 Exemple : \`${prefix}choisir 2\``,
+    pageCount > 1 ? `📄 Page ${page}/${pageCount} — écris \`${prefix}message page <numéro>\` pour parcourir les autres pages.` : "",
+    `💡 Exemple : \`${prefix}choisir ${start + 1}\``,
     `🛑 Annuler : \`${prefix}message annule\``
-  ].join("\n");
+  ].filter(Boolean).join("\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -331,6 +368,21 @@ async function handleMessage(context = {}) {
   const afterCommand = body.replace(/^[^\s]+\s*/, "").trim();
   const rawText = args.length ? args.join(" ").trim() : afterCommand;
   const firstWord = normalize(rawText.split(/\s+/)[0] || "");
+
+  const pageMatch = rawText.match(/^page(?:\s+(\d+))?$/i);
+  if (pageMatch) {
+    await loadAll(globalData);
+    const pending = store[`pending_${senderID}`];
+    if (!pending || pending.type !== "pending" || !Array.isArray(pending.recipients)) {
+      return send({ api, message, event }, `❌ Aucun choix de destinataire en attente. Commence par \`${prefix}message <ton message>\`.`);
+    }
+    const page = pageMatch[1] ? Number(pageMatch[1]) : 1;
+    const pageCount = Math.max(1, Math.ceil(pending.recipients.length / RECIPIENTS_PER_PAGE));
+    if (!Number.isInteger(page) || page < 1 || page > pageCount) {
+      return send({ api, message, event }, `❌ Page invalide. Choisis une page entre 1 et ${pageCount}.`);
+    }
+    return send({ api, message, event }, buildRecipientsText(prefix, pending.recipients, page));
+  }
 
   if (["annule", "annuler", "cancel", "stop"].includes(firstWord)) {
     await mutate(globalData, () => {
@@ -393,7 +445,7 @@ async function handleNumberSelection(context, index) {
   }
 
   const recipients = Array.isArray(pending.recipients) ? pending.recipients : [];
-  if (isNaN(index) || index < 1 || index > recipients.length) {
+  if (!Number.isInteger(index) || index < 1 || index > recipients.length) {
     return send({ api, message, event }, `❌ Numéro invalide. Choisis entre 1 et ${recipients.length}.`);
   }
 
@@ -507,8 +559,9 @@ async function handleCommand(context = {}) {
 
   // Cas "!choisir 2" / "!select 2" / "!destinataire 2"
   if (["choisir", "select", "destinataire"].includes(invoked) || ["choisir", "select", "destinataire"].includes(invokedFromBody)) {
-    const num = parseInt(args[0], 10);
-    if (isNaN(num)) {
+    const rawSelection = String(args[0] || "").trim();
+    const num = /^\d+$/.test(rawSelection) ? Number(rawSelection) : NaN;
+    if (!Number.isInteger(num)) {
       return send(context, "❌ Utilisation : `!choisir <numéro>` — exemple : `!choisir 2`.");
     }
     return handleNumberSelection(context, num);
@@ -527,18 +580,26 @@ module.exports = {
   config: {
     name: "message",
     aliases: ["msg", "dm", "voir", "messages", "inbox", "choisir", "select", "destinataire"],
-    version: "5.0.0",
+    version: "6.0.0",
     author: "Diwate",
-    description: "Envoie un message privé (choix par !choisir <numéro>) avec la vraie liste d'utilisateurs GoatBot",
+    description: "Enregistre les utilisateurs actifs et permet de leur envoyer un message privé via une liste paginée",
     category: "Social",
-    usages: "message <texte> | choisir <numéro> | message annule | voir",
+    usages: "message <texte> | message page <numéro> | choisir <numéro> | message annule | voir",
     role: 0
   },
   STORAGE_KEY, INDEX_KEY, ACTIVITY_KEY, MAX_MESSAGE_LENGTH,
   trackActivity, getMostActiveThread, getAllUsersFromGoatBot,
   handleMessage, handleNumberSelection, handleVoir,
+  buildRecipientsList, buildRecipientsText, resolveDisplayName, cleanName, extractProfileName,
+  onChat: function (context) {
+    return async function () {
+      try { await trackActivity(context); }
+      catch (error) { console.warn("[Message] Suivi de l’activité impossible :", error && (error.message || error)); }
+    };
+  },
   onStart: async function (context) {
     try {
+      await trackActivity(context);
       return await handleCommand(context);
     } catch (error) {
       console.error("[Commande message]", error.stack || error);

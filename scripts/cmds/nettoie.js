@@ -1,373 +1,492 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const { send } = require("./lib/messenger");
 
-const CONFIRM_TIMEOUT_MS = 60_000;
+const RAPHAEL_PREFIX = "raphaelConversation:";
+const RANG_FILE = path.join(__dirname, "../../database/rang.json");
+const CONFIRMATION_TTL_MS = 2 * 60 * 1000;
+const DRAIN_TIMEOUT_MS = 8000;
+const GUARDED_HOOKS = ["onStart", "onReply", "onChat", "onEvent", "onAnyEvent", "onFirstChat", "onReaction"];
+const WRAPPED_COMMANDS = new WeakSet();
+const PATCHED_MAPS = new WeakSet();
+const pendingConfirmations = new Map();
 
-// Table commande -> clés
-const COMMAND_KEYS = {
-  bank: ["goatBotBankData"],
-  claim: ["claimCooldownsV1"],
-  ban: ["goatBotCommandBans"],
-  match: ["goatBotMatchData"],
-  quizz: [
-    "quizCultureSessions",
-    "quizCultureQuestionHistory",
-    "animeQuizSessionsV3",
-    "animeQuizQuestionHistoryV3"
-  ],
-  message: [
-    "privateMessagesV3",
-    "privateMessagesUsersV3",
-    "privateMessagesActivityV3"
-  ],
-  limite: ["limiteGlobalV1"],
-  magie: ["magieSessionsV1"],
-  defi: ["messengerArenaGames"]
+let cleanupInProgress = false;
+let activeCommandHooks = 0;
+
+// Liste blanche stricte : aucun enregistrement inconnu, profil utilisateur,
+// paramètre essentiel ou donnée de session Messenger n’est effacé.
+const COMMAND_SCOPES = {
+  animequizz: {
+    aliases: ["animequiz", "reponse", "réponse", "next", "animestats", "annule", "annulé", "annuler", "cancel"],
+    keys: ["animeQuizSessionsV3", "animeQuizQuestionHistoryV3"],
+    memory: "animequizz"
+  },
+  ban: { aliases: ["deban"], keys: ["goatBotCommandBans"], memory: "ban" },
+  bangroupe: { aliases: ["debangroupe"], keys: ["goatBotGroupCommandBlocks"], memory: "bangroupe" },
+  defi: { aliases: ["défi"], keys: ["messengerArenaGames"], memory: "defi" },
+  hentai: { aliases: [], memory: "hentai" },
+  limite: { aliases: [], keys: ["userCommandUsageLimitsV1"], memory: "limite" },
+  message: { aliases: ["msg", "dm", "voir", "messages", "inbox", "choisir", "select", "destinataire"], keys: ["privateMessagesV5", "privateMessagesUsersV5", "privateMessagesActivityV5"], memory: "message" },
+  off: { aliases: ["on"], keys: ["goatBotMaintenanceMode"], memory: "off" },
+  raphael: { aliases: ["raphaël", "sage"], dynamicPrefix: RAPHAEL_PREFIX, memory: "raphael" },
+  rang: { aliases: ["rank"], file: RANG_FILE, memory: "rang" },
+  "anti-spam": { aliases: ["antispam"], threadPath: "data.antiSpam", memory: "anti-spam" },
+  animelist: { aliases: [], memory: "animelist" },
+  sondage: { aliases: ["vote"], keys: ["messengerPolls"], memory: "polls" }
 };
 
-// Clés dynamiques (préfixes)
-const PREFIX_KEYS = {
-  raphael: ["raphaelConversation:"]
+const GLOBAL_KEY_DEFAULTS = {
+  animeQuizSessionsV3: {},
+  animeQuizQuestionHistoryV3: {},
+  goatBotCommandBans: [],
+  goatBotGroupCommandBlocks: {},
+  messengerArenaGames: {},
+  userCommandUsageLimitsV1: { version: 1, enabled: false, users: {} },
+  privateMessagesV5: {},
+  privateMessagesUsersV5: {},
+  privateMessagesActivityV5: {},
+  goatBotMaintenanceMode: { off: false, changedAt: 0, changedBy: "nettoie" },
+  messengerPolls: {}
 };
-
-// Toutes les clés statiques (pour "tout")
-const ALL_STATIC_KEYS = [...new Set(Object.values(COMMAND_KEYS).flat())];
-// Tous les préfixes
-const ALL_PREFIX_KEYS = [...new Set(Object.values(PREFIX_KEYS).flat())];
-
-// Confirmations en attente : { userID: { expiresAt, scope, keys, prefixes } }
-const pending = new Map();
-
-// ---------------------------------------------------------------------------
-// Utilitaires
-// ---------------------------------------------------------------------------
-
-function normalizeID(value) {
-  if (value == null) return "";
-  if (typeof value === "object") {
-    return String(value.id || value.userID || value.userId || value.senderID || value.author || "").trim();
-  }
-  return String(value).trim();
-}
-
-function getSenderID(event) {
-  return normalizeID(event && (event.senderID || event.senderId || event.userID || event.author));
-}
-
-function getPrefix(context = {}) {
-  if (context.prefix) return String(context.prefix);
-  const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
-  const p = config.prefix;
-  if (Array.isArray(p)) return String(p[0] || "!");
-  return String(p || "!");
-}
-
-function getOwnerIDs() {
-  const configuredOwner = String(process.env.BOT_OWNER_ID || "").trim();
-  if (configuredOwner) return [configuredOwner];
-  const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
-  const ids = Array.isArray(config.adminBot) ? config.adminBot : config.adminBot ? [config.adminBot] : [];
-  return ids.map(normalizeID).filter(Boolean);
-}
-
-function isOwner(userID) {
-  return getOwnerIDs().includes(normalizeID(userID));
-}
 
 function normalize(value) {
   return String(value || "").normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 }
-
-// ---------------------------------------------------------------------------
-// Découverte
-// ---------------------------------------------------------------------------
-
-async function discoverForKeys(globalData, staticKeys, prefixes) {
-  const found = [];
-  if (!globalData || typeof globalData.get !== "function") return found;
-
-  for (const key of staticKeys) {
-    try {
-      const value = await globalData.get(key, "data", null);
-      if (value !== null && value !== undefined) found.push({ key, type: "static" });
-    } catch (_) {}
-  }
-
-  if (prefixes.length === 0) return found;
-
-  if (typeof globalData.keys === "function") {
-    try {
-      const all = await globalData.keys("data");
-      if (Array.isArray(all)) {
-        for (const key of all) {
-          if (prefixes.some(p => String(key).startsWith(p))) {
-            if (!found.some(f => f.key === key)) found.push({ key, type: "dynamic" });
-          }
-        }
-      }
-    } catch (_) {}
-  } else if (typeof globalData.getAll === "function") {
-    try {
-      const all = await globalData.getAll("data");
-      if (all && typeof all === "object") {
-        for (const key of Object.keys(all)) {
-          if (prefixes.some(p => key.startsWith(p))) {
-            if (!found.some(f => f.key === key)) found.push({ key, type: "dynamic" });
-          }
-        }
-      }
-    } catch (_) {}
-  }
-
-  return found;
+function normalizeCommandName(value) {
+  return normalize(String(value || "").replace(/\.js$/i, "")).replace(/[^a-z0-9-]/g, "");
 }
-
-async function removeKey(globalData, key) {
-  if (!globalData) return { ok: false, method: "no-storage" };
-  if (typeof globalData.remove === "function") {
-    try { await globalData.remove(key); return { ok: true, method: "remove" }; } catch (_) {}
-  }
-  if (typeof globalData.delete === "function") {
-    try { await globalData.delete(key); return { ok: true, method: "delete" }; } catch (_) {}
-  }
-  if (typeof globalData.set === "function") {
-    try { await globalData.set(key, null, "data"); return { ok: true, method: "set-null" }; } catch (_) {}
-  }
-  return { ok: false, method: "unsupported" };
+function normalizeID(value) {
+  if (value == null) return "";
+  if (typeof value === "object") return String(value.id || value.userID || value.userId || value.senderID || value.author || "").trim();
+  return String(value).trim();
 }
-
-// ---------------------------------------------------------------------------
-// Résolution de la portée demandée
-// ---------------------------------------------------------------------------
-
-function resolveScope(action, subAction) {
-  const a = normalize(action || "");
-  const s = normalize(subAction || "");
-
-  // !nettoie tout
-  if (a === "tout" || a === "all" || a === "everything") {
-    return { scope: "tout", staticKeys: ALL_STATIC_KEYS, prefixes: ALL_PREFIX_KEYS };
+function getOwnerIDs() {
+  const envOwner = String(process.env.BOT_OWNER_ID || "").trim();
+  if (envOwner) return [envOwner];
+  const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
+  const explicitOwner = normalizeID(config.ownerID || config.ownerId || config.botOwnerID);
+  if (explicitOwner) return [explicitOwner];
+  const admins = Array.isArray(config.adminBot) ? config.adminBot : config.adminBot ? [config.adminBot] : [];
+  const first = admins.map(normalizeID).find(Boolean);
+  return first ? [first] : [];
+}
+function getSenderID(event) {
+  return normalizeID(event && (event.senderID || event.senderId || event.userID || event.author));
+}
+function isOwner(event) {
+  const id = getSenderID(event);
+  return Boolean(id && getOwnerIDs().includes(id));
+}
+function getPrefix(context = {}) {
+  if (context.prefix) return String(context.prefix);
+  const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
+  const prefix = config.prefix;
+  return Array.isArray(prefix) ? String(prefix[0] || "!") : String(prefix || "!");
+}
+function getAction(context = {}) {
+  const args = Array.isArray(context.args) ? context.args : [];
+  if (args.length) return args.map(value => String(value || "")).join(" ").trim();
+  const body = String(context.event && (context.event.body || context.event.message) || "").trim();
+  return body.replace(/^\S+\s*/, "").trim();
+}
+function getGlobalRows(globalData) {
+  if (!globalData || typeof globalData.getAll !== "function") throw new Error("L’inventaire global des données n’est pas disponible.");
+  return Promise.resolve(globalData.getAll()).then(rows => Array.isArray(rows) ? rows : []);
+}
+function countEntries(value) {
+  if (Array.isArray(value)) return value.length;
+  if (value && typeof value === "object") return Object.keys(value).length;
+  return value == null ? 0 : 1;
+}
+async function readRankSummary() {
+  try {
+    const [text, stat] = await Promise.all([fs.promises.readFile(RANG_FILE, "utf8"), fs.promises.stat(RANG_FILE)]);
+    const parsed = JSON.parse(text);
+    const users = parsed && parsed.users && typeof parsed.users === "object" && !Array.isArray(parsed.users) ? parsed.users : {};
+    return { exists: true, users: Object.keys(users).length, mtimeMs: stat.mtimeMs };
+  } catch (error) {
+    if (error && error.code === "ENOENT") return { exists: false, users: 0, mtimeMs: 0 };
+    throw new Error(`Le fichier de rang ne peut pas être lu sans risque : ${error.message || error}`);
   }
-
-  // !nettoie <commande>
-  if (COMMAND_KEYS[a]) {
-    return { scope: a, staticKeys: COMMAND_KEYS[a], prefixes: [] };
+}
+async function readAntiSpamThreads(threadsData) {
+  if (!threadsData || typeof threadsData.getAll !== "function") throw new Error("L’inventaire des conversations n’est pas disponible pour nettoyer les options anti-spam.");
+  const rows = await threadsData.getAll();
+  if (!Array.isArray(rows)) throw new Error("La liste des conversations est invalide; aucun nettoyage n’a été exécuté.");
+  return rows
+    .filter(row => row && row.data && typeof row.data === "object" && Object.prototype.hasOwnProperty.call(row.data, "antiSpam"))
+    .map(row => normalizeID(row.threadID || row.threadId || row.id))
+    .filter(Boolean)
+    .sort();
+}
+function commandExists(commandName) {
+  const goatBot = global.GoatBot;
+  for (const map of [goatBot && goatBot.commands, goatBot && goatBot.eventCommands]) {
+    if (!map || typeof map.values !== "function") continue;
+    for (const command of map.values()) {
+      const name = normalizeCommandName(command && command.config && command.config.name);
+      const aliases = Array.isArray(command && command.config && command.config.aliases) ? command.config.aliases.map(normalizeCommandName) : [];
+      if (name === commandName || aliases.includes(commandName)) return true;
+    }
   }
-  if (PREFIX_KEYS[a]) {
-    return { scope: a, staticKeys: [], prefixes: PREFIX_KEYS[a] };
-  }
-
-  // Alias : "messages" -> message, "defis" -> defi, etc.
-  const aliasMap = {
-    banque: "bank", solde: "bank",
-    quotidien: "claim", daily: "claim",
-    bans: "ban",
-    amour: "match", compat: "match",
-    quiz: "quizz",
-    msg: "message", dm: "message",
-    limits: "limite", limit: "limite",
-    magies: "magie", tour: "magie",
-    defis: "defi", combat: "defi", arene: "defi", arène: "defi",
-    rap: "raphael", grand: "raphael"
-  };
-  const mapped = aliasMap[a];
-  if (mapped) {
-    if (COMMAND_KEYS[mapped]) return { scope: mapped, staticKeys: COMMAND_KEYS[mapped], prefixes: [] };
-    if (PREFIX_KEYS[mapped]) return { scope: mapped, staticKeys: [], prefixes: PREFIX_KEYS[mapped] };
+  return false;
+}
+function resolveScope(input) {
+  const normalized = normalizeCommandName(input);
+  for (const [name, scope] of Object.entries(COMMAND_SCOPES)) {
+    if (normalizeCommandName(name) === normalized || (scope.aliases || []).some(alias => normalizeCommandName(alias) === normalized)) {
+      return { name, scope };
+    }
   }
   return null;
 }
-
-function scopeLabel(scope) {
-  if (scope === "tout") return "TOUT (toutes les commandes)";
-  return scope;
+function getLoadedCommand(name) {
+  const goatBot = global.GoatBot || {};
+  for (const map of [goatBot.commands, goatBot.eventCommands]) {
+    if (!map || typeof map.values !== "function") continue;
+    for (const command of map.values()) {
+      if (normalizeCommandName(command && command.config && command.config.name) === normalizeCommandName(name)) return command;
+    }
+  }
+  const file = path.join(__dirname, `${name}.js`);
+  if (fs.existsSync(file)) {
+    try { return require(file); } catch (error) { console.warn(`[nettoie] Impossible de charger le module ${name} pour purger son cache :`, error.message || error); }
+  }
+  return null;
 }
-
-// ---------------------------------------------------------------------------
-// Affichage de l'aide
-// ---------------------------------------------------------------------------
-
-function buildHelpText(prefix) {
-  const lines = Object.keys(COMMAND_KEYS).map(name => `• \`${prefix}nettoie ${name}\``).join("\n");
-  const prefixLines = Object.keys(PREFIX_KEYS).map(name => `• \`${prefix}nettoie ${name}\``).join("\n");
+function getStorageKeys(rows) {
+  return new Set(rows.map(row => String(row && row.key || "")).filter(Boolean));
+}
+async function buildTargetPlan(scopeName, scope, context) {
+  const rows = (scope.keys || scope.dynamicPrefix) ? await getGlobalRows(context.globalData) : [];
+  const existingKeys = getStorageKeys(rows);
+  const keys = (scope.keys || []).filter(key => existingKeys.has(key)).sort();
+  const dynamicKeys = scope.dynamicPrefix ? Array.from(existingKeys).filter(key => key.startsWith(scope.dynamicPrefix)).sort() : [];
+  const antiSpamThreads = scope.threadPath ? await readAntiSpamThreads(context.threadsData) : [];
+  const rank = scope.file ? await readRankSummary() : { exists: false, users: 0, mtimeMs: 0 };
+  return { scopeName, keys, dynamicKeys, antiSpamThreads, rank };
+}
+async function buildGlobalPlan(context) {
+  const rows = await getGlobalRows(context.globalData);
+  const existingKeys = getStorageKeys(rows);
+  const knownKeys = Object.keys(GLOBAL_KEY_DEFAULTS).filter(key => existingKeys.has(key)).sort();
+  const dynamicKeys = Array.from(existingKeys).filter(key => key.startsWith(RAPHAEL_PREFIX)).sort();
+  const antiSpamThreads = await readAntiSpamThreads(context.threadsData);
+  const rank = await readRankSummary();
+  const counts = Object.fromEntries(rows.filter(row => row && row.key).map(row => [String(row.key), countEntries(row.data)]));
+  return { knownKeys, dynamicKeys, antiSpamThreads, rank, counts };
+}
+function getPlanFingerprint(plan) {
+  return JSON.stringify({
+    knownKeys: plan.knownKeys,
+    dynamicKeys: plan.dynamicKeys,
+    antiSpamThreads: plan.antiSpamThreads,
+    rank: plan.rank
+  });
+}
+function describeGlobalPlan(plan, prefix) {
+  const categories = [];
+  if (plan.knownKeys.includes("goatBotCommandBans")) categories.push("restrictions individuelles (ban/deban)");
+  if (plan.knownKeys.includes("goatBotGroupCommandBlocks")) categories.push("blocages de commandes par groupe");
+  if (plan.knownKeys.includes("goatBotMaintenanceMode")) categories.push("mode maintenance (remis sur actif)");
+  if (plan.knownKeys.includes("userCommandUsageLimitsV1")) categories.push("limites d’utilisation (désactivées et compteurs remis à zéro)");
+  if (plan.knownKeys.some(key => key.startsWith("animeQuiz"))) categories.push("quiz et historique des questions");
+  if (plan.knownKeys.includes("messengerArenaGames")) categories.push("parties de défi");
+  if (plan.knownKeys.some(key => key.startsWith("privateMessages"))) categories.push("boîtes de réception et index de destinataires");
+  if (plan.knownKeys.includes("messengerPolls")) categories.push("sondages et votes");
+  if (plan.dynamicKeys.length) categories.push("mémoires Raphaël par conversation");
+  if (plan.antiSpamThreads.length) categories.push("options anti-spam de groupe");
+  if (plan.rank.exists) categories.push("classements de rang");
+  categories.push("caches temporaires hentai et rotation animelist");
   return [
-    `🧹 **Commande nettoie** — réservée au propriétaire`,
+    "🧹 **Aperçu du nettoyage global (portée commandes uniquement)**",
+    `• ${plan.knownKeys.length + plan.dynamicKeys.length} enregistrement(s) global(aux) identifiable(s)`,
+    `• ${plan.antiSpamThreads.length} conversation(s) avec réglage anti-spam`,
+    `• ${plan.rank.users} profil(s) de rang dans database/rang.json`,
+    `• Cibles : ${categories.join("; ")}.`,
     "",
-    "**Effacer une commande spécifique :**",
-    lines,
-    prefixLines,
-    "",
-    `**Effacer TOUT :** \`${prefix}nettoie tout\``,
-    `**Voir ce qui existe (sans rien effacer) :** \`${prefix}nettoie liste\``,
-    "",
-    "💡 Pour chaque suppression, une confirmation dans les 60 s est demandée :",
-    `   \`${prefix}nettoie <commande>\` puis \`${prefix}nettoie confirmer\``
+    "Les profils utilisateur, les autres paramètres de groupe, les clés globales inconnues, la configuration, le compte/session Messenger et les fichiers médias seront conservés.",
+    `Pour confirmer dans les 2 minutes : \`${prefix}nettoie confirmer\`. Pour annuler : \`${prefix}nettoie annuler\`.`
   ].join("\n");
 }
-
-// ---------------------------------------------------------------------------
-// Liste
-// ---------------------------------------------------------------------------
-
-async function handleList(globalData, context) {
-  const { api, message, event } = context;
-  const prefix = getPrefix(context);
-
-  const found = await discoverForKeys(globalData, ALL_STATIC_KEYS, ALL_PREFIX_KEYS);
-
-  if (found.length === 0) {
-    return send({ api, message, event }, `ℹ️ Aucune donnée enregistrée actuellement.\n\n💡 Voir l’aide : \`${prefix}nettoie aide\``);
+async function clearAntiSpamSettings(threadsData, threadIDs) {
+  if (!threadIDs.length) return 0;
+  if (!threadsData || typeof threadsData.deleteKey !== "function") throw new Error("L’API de suppression ciblée des options anti-spam n’est pas disponible.");
+  let cleared = 0;
+  for (const threadID of threadIDs) {
+    await threadsData.deleteKey(threadID, "data.antiSpam");
+    cleared++;
   }
-
-  const lines = found.map(({ key, type }) => `• \`${key}\` ${type === "dynamic" ? "(dynamique)" : ""}`);
-  return send(
-    { api, message, event },
-    `📋 **Données actuellement présentes (${found.length}) :**\n\n${lines.join("\n")}\n\n` +
-    `🧹 Pour effacer tout : \`${prefix}nettoie tout\`\n` +
-    `🧹 Pour effacer une partie : \`${prefix}nettoie <commande>\` (ex. \`${prefix}nettoie defi\`)`
-  );
+  return cleared;
 }
-
-// ---------------------------------------------------------------------------
-// Commande principale
-// ---------------------------------------------------------------------------
-
-async function handleNettoie(context = {}) {
-  const { api, message, event, globalData } = context;
-  const prefix = getPrefix(context);
-  const userID = getSenderID(event);
-  const args = Array.isArray(context.args) ? context.args : [];
-  const action = normalize(args[0] || "");
-  const subAction = normalize(args[1] || "");
-
-  // Sécurité
-  if (!userID || !isOwner(userID)) {
-    return send({ api, message, event }, "⛔ Seul le propriétaire du bot peut utiliser cette commande.");
+function emptyValueForKey(key, ownerID) {
+  if (Object.prototype.hasOwnProperty.call(GLOBAL_KEY_DEFAULTS, key)) {
+    if (key === "goatBotMaintenanceMode") return { off: false, changedAt: Date.now(), changedBy: String(ownerID || "nettoie") };
+    return GLOBAL_KEY_DEFAULTS[key];
   }
-
-  if (!globalData || typeof globalData.get !== "function") {
-    return send({ api, message, event }, "❌ Le stockage persistant du bot est indisponible. Rien n’a été effacé.");
+  if (key.startsWith(RAPHAEL_PREFIX)) return { version: 1, messages: [], participants: {}, updatedAt: null };
+  return undefined;
+}
+async function clearPersistentKeys(globalData, keys, ownerID) {
+  if (!keys.length) return 0;
+  if (!globalData || typeof globalData.set !== "function") throw new Error("L’API d’écriture globalData n’est pas disponible.");
+  let cleared = 0;
+  for (const key of keys) {
+    const value = emptyValueForKey(key, ownerID);
+    if (value === undefined) continue;
+    await globalData.set(key, value, "data");
+    cleared++;
   }
-
-  // ---- Aide ----
-  if (["", "aide", "help"].includes(action)) {
-    return send({ api, message, event }, buildHelpText(prefix));
-  }
-
-  // ---- Liste ----
-  if (["liste", "list", "info", "status"].includes(action)) {
-    return handleList(globalData, context);
-  }
-
-  // ---- Confirmation ----
-  if (["confirmer", "confirm", "oui"].includes(action)) {
-    const confirm = pending.get(userID);
-    if (!confirm || Date.now() > confirm.expiresAt) {
-      pending.delete(userID);
-      return send({ api, message, event }, `⌛ Aucune confirmation en attente (ou expirée). Lance \`${prefix}nettoie <commande>\` ou \`${prefix}nettoie tout\` pour recommencer.`);
+  return cleared;
+}
+async function resetMemoryForScope(name, context) {
+  const command = getLoadedCommand(name);
+  if (!command) return 0;
+  let cleared = 0;
+  const invoke = async method => {
+    if (typeof command[method] === "function") {
+      await command[method]();
+      cleared++;
     }
-    pending.delete(userID);
+  };
+  switch (name) {
+    case "animequizz": await invoke("clearAllQuestionTimers"); break;
+    case "ban": await invoke("_clearCache"); break;
+    case "bangroupe": await invoke("_clearCache"); break;
+    case "defi": await invoke("_clearMemory"); break;
+    case "hentai": await invoke("_clearUsage"); break;
+    case "limite": await invoke("_resetForTests"); break;
+    case "message": await invoke("_clearMemory"); break;
+    case "off": await invoke("_clearCache"); break;
+    case "raphael": await invoke("_clearMemory"); break;
+    case "rang": break; // Le reset séquencé du fichier est effectué une seule fois par clearTarget/clearGlobal.
+    case "anti-spam": await invoke("_clearMemory"); break;
+    case "animelist": await invoke("_clearRotation"); break;
+    case "sondage": {
+      const polls = require("./lib/polls");
+      if (typeof polls.clearMemory === "function") { await polls.clearMemory(); cleared++; }
+      break;
+    }
+  }
+  return cleared;
+}
+async function clearTarget(scopeName, scope, plan, context) {
+  const globalKeys = [...plan.keys, ...plan.dynamicKeys];
+  const ownerID = getSenderID(context.event);
+  let keysCleared = await clearPersistentKeys(context.globalData, globalKeys, ownerID);
+  let threadsCleared = 0;
+  if (scope.threadPath) threadsCleared = await clearAntiSpamSettings(context.threadsData, plan.antiSpamThreads);
+  let fileRecordsCleared = 0;
+  if (scope.file && plan.rank.exists) {
+    const command = getLoadedCommand("rang");
+    if (!command || typeof command.clearRankData !== "function") throw new Error("La fonction de reset sécurisé de rang n’est pas disponible.");
+    fileRecordsCleared = await command.clearRankData();
+  }
+  const memoryCachesCleared = await resetMemoryForScope(scopeName, context);
+  return { keysCleared, threadsCleared, fileRecordsCleared, memoryCachesCleared };
+}
+async function clearGlobal(plan, context) {
+  cleanupInProgress = true;
+  try {
+    // Arrête immédiatement les minuteurs susceptibles de réécrire des états de quiz.
+    const animequizz = getLoadedCommand("animequizz");
+    if (animequizz && typeof animequizz.clearAllQuestionTimers === "function") await animequizz.clearAllQuestionTimers();
+    await waitForActiveHooks();
 
-    const results = [];
-    let successCount = 0;
-    let failureCount = 0;
-
-    try {
-      for (const key of confirm.keys) {
-        const result = await removeKey(globalData, key);
-        if (result.ok) { successCount++; results.push(`✅ ${key} (${result.method})`); }
-        else { failureCount++; results.push(`⚠️ ${key} — échec (${result.method})`); }
-      }
-    } catch (error) {
-      console.error("[Commande nettoie] Erreur pendant l’effacement :", error.stack || error);
-      return send(
-        { api, message, event },
-        `❌ Erreur pendant l’effacement. Certaines clés ont peut-être déjà été supprimées.\n\n${results.slice(0, 10).join("\n")}`
-      );
+    const stablePlan = await buildGlobalPlan(context);
+    if (getPlanFingerprint(stablePlan) !== getPlanFingerprint(plan)) {
+      throw new Error("Les données ont changé pendant le verrouillage. Aucun reset n’a été appliqué; relance l’aperçu puis confirme à nouveau.");
     }
 
-    const header = successCount > 0
-      ? `🧹 **Nettoyage terminé** (${scopeLabel(confirm.scope)}).\n\n`
-      : `ℹ️ **Aucune donnée à effacer** pour ${scopeLabel(confirm.scope)}.\n\n`;
-    const summary = [
-      `✅ Clés effacées : ${successCount}`,
-      failureCount > 0 ? `⚠️ Échecs : ${failureCount}` : null
-    ].filter(Boolean).join("\n");
-    const detail = results.length > 0 && results.length <= 30
-      ? `\n\n**Détail :**\n${results.join("\n")}`
-      : results.length > 30
-        ? `\n\n**Détail :** ${results.slice(0, 30).join("\n")}\n… (+${results.length - 30} autres)`
-        : "";
+    const ownerID = getSenderID(context.event);
+    const allGlobalKeys = [...stablePlan.knownKeys, ...stablePlan.dynamicKeys];
+    const keysCleared = await clearPersistentKeys(context.globalData, allGlobalKeys, ownerID);
+    const threadsCleared = await clearAntiSpamSettings(context.threadsData, stablePlan.antiSpamThreads);
 
-    console.log(`[Commande nettoie] scope=${confirm.scope} — ${successCount} clé(s) effacée(s), ${failureCount} échec(s).`);
+    const rang = getLoadedCommand("rang");
+    const fileRecordsCleared = rang && typeof rang.clearRankData === "function" ? await rang.clearRankData() : 0;
 
-    return send({ api, message, event }, `${header}${summary}${detail}`);
+    let memoryCachesCleared = 0;
+    for (const name of Object.keys(COMMAND_SCOPES)) {
+      memoryCachesCleared += await resetMemoryForScope(name, context);
+    }
+    return { keysCleared, threadsCleared, fileRecordsCleared, memoryCachesCleared };
+  } finally {
+    cleanupInProgress = false;
   }
-
-  // ---- Demande de suppression ----
-  const scopeInfo = resolveScope(action);
-  if (!scopeInfo) {
-    return send(
-      { api, message, event },
-      `❓ Commande inconnue : \`${action}\`.\n\n${buildHelpText(prefix)}`
-    );
-  }
-
-  // Vérifier que des clés existent réellement pour cette portée
-  const found = await discoverForKeys(globalData, scopeInfo.staticKeys, scopeInfo.prefixes);
-  if (found.length === 0) {
-    return send(
-      { api, message, event },
-      `ℹ️ Aucune donnée à effacer pour ${scopeLabel(scopeInfo.scope)}.\n\n` +
-      `💡 Pour voir ce qui existe : \`${prefix}nettoie liste\``
-    );
-  }
-
-  // Enregistrer la demande de confirmation
-  pending.set(userID, {
-    expiresAt: Date.now() + CONFIRM_TIMEOUT_MS,
-    scope: scopeInfo.scope,
-    keys: found.map(f => f.key)
+}
+function waitForActiveHooks() {
+  const deadline = Date.now() + DRAIN_TIMEOUT_MS;
+  return new Promise((resolve, reject) => {
+    const poll = () => {
+      if (activeCommandHooks === 0) return resolve();
+      if (Date.now() >= deadline) return reject(new Error("Des commandes sont encore en cours; aucun nettoyage n’a été effectué. Réessaie dans quelques secondes."));
+      setTimeout(poll, 50);
+    };
+    poll();
   });
+}
+async function runTarget(scopeName, scope, context) {
+  cleanupInProgress = true;
+  try {
+    if (scopeName === "animequizz") {
+      const command = getLoadedCommand(scopeName);
+      if (command && typeof command.clearAllQuestionTimers === "function") await command.clearAllQuestionTimers();
+    }
+    await waitForActiveHooks();
+    const plan = await buildTargetPlan(scopeName, scope, context);
+    return await clearTarget(scopeName, scope, plan, context);
+  } finally {
+    cleanupInProgress = false;
+  }
+}
+function wrapCommand(command) {
+  if (!command || !command.config || WRAPPED_COMMANDS.has(command)) return command;
+  WRAPPED_COMMANDS.add(command);
+  const commandName = normalizeCommandName(command.config.name);
+  for (const hookName of GUARDED_HOOKS) {
+    const original = command[hookName];
+    if (typeof original !== "function") continue;
+    command[hookName] = async function (...args) {
+      const context = args[0] || {};
+      if (cleanupInProgress && commandName !== "nettoie") {
+        if (hookName === "onStart" || hookName === "onReply") {
+          try { await send(context, "🧹 Nettoyage en cours. Réessaie dans quelques secondes."); } catch (_) {}
+        }
+        return undefined;
+      }
+      const counted = commandName !== "nettoie";
+      if (counted) activeCommandHooks++;
+      try {
+        const result = await original.apply(this, args);
+        if (typeof result !== "function") return result;
+        const callback = result;
+        return async function (...callbackArgs) {
+          if (cleanupInProgress && commandName !== "nettoie") {
+            return undefined;
+          }
+          const callbackCounted = commandName !== "nettoie";
+          if (callbackCounted) activeCommandHooks++;
+          try { return await callback.apply(this, callbackArgs); }
+          finally { if (callbackCounted) activeCommandHooks = Math.max(0, activeCommandHooks - 1); }
+        };
+      }
+      finally { if (counted) activeCommandHooks = Math.max(0, activeCommandHooks - 1); }
+    };
+  }
+  return command;
+}
+function patchCommandMap(map) {
+  if (!map || typeof map.set !== "function" || PATCHED_MAPS.has(map)) return;
+  PATCHED_MAPS.add(map);
+  for (const command of map.values()) wrapCommand(command);
+  const originalSet = map.set.bind(map);
+  map.set = function (key, command) {
+    wrapCommand(command);
+    return originalSet(key, command);
+  };
+}
+async function installGuard() {
+  const goatBot = global.GoatBot;
+  if (!goatBot) return;
+  patchCommandMap(goatBot.commands);
+  patchCommandMap(goatBot.eventCommands);
+}
+function formatResult(result) {
+  return `✅ Nettoyage terminé.\n• ${result.keysCleared} enregistrement(s) global(aux) réinitialisé(s)\n• ${result.threadsCleared} réglage(s) anti-spam supprimé(s)\n• ${result.fileRecordsCleared} profil(s) de rang remis à zéro\n• ${result.memoryCachesCleared} cache(s) mémoire vidé(s).`;
+}
+async function onStart(context = {}) {
+  const { api, message, event } = context;
+  if (!isOwner(event)) return send({ api, message, event }, "⛔ Seul le propriétaire du bot peut nettoyer ses données de commandes.");
 
-  const preview = found.slice(0, 15).map(f => `• \`${f.key}\``).join("\n");
-  const more = found.length > 15 ? `\n… (+${found.length - 15} autres)` : "";
+  const prefix = getPrefix(context);
+  const raw = getAction(context);
+  const args = raw.split(/\s+/).filter(Boolean);
+  const action = normalizeCommandName(args[0] || "");
+  const ownerID = getSenderID(event);
 
-  return send(
-    { api, message, event },
-    `⚠️ **Confirmation requise** — ${scopeLabel(scopeInfo.scope)}\n\n` +
-    `Clés qui seront effacées (${found.length}) :\n${preview}${more}\n\n` +
-    `✅ Écris \`${prefix}nettoie confirmer\` dans les 60 secondes.\n` +
-    `❌ Sinon, ignore simplement ce message.`
-  );
+  if (action === "annuler" || action === "cancel") {
+    pendingConfirmations.delete(ownerID);
+    return send({ api, message, event }, "✅ Nettoyage global annulé. Aucune donnée n’a été modifiée.");
+  }
+
+  if (action === "confirmer" || action === "confirm") {
+    const pending = pendingConfirmations.get(ownerID);
+    if (!pending || Date.now() > pending.expiresAt) {
+      pendingConfirmations.delete(ownerID);
+      return send({ api, message, event }, `ℹ️ Aucun nettoyage global en attente. Écris \`${prefix}nettoie\` pour afficher l’aperçu.`);
+    }
+    let currentPlan;
+    try { currentPlan = await buildGlobalPlan(context); }
+    catch (error) { return send({ api, message, event }, `❌ Impossible de revérifier les données : ${String(error.message || error).slice(0, 180)}. Aucune suppression lancée.`); }
+    if (getPlanFingerprint(currentPlan) !== pending.fingerprint) {
+      pendingConfirmations.delete(ownerID);
+      return send({ api, message, event }, `⚠️ Les données ont changé depuis l’aperçu. Rien n’a été effacé. Écris \`${prefix}nettoie\` pour recalculer le plan.`);
+    }
+    pendingConfirmations.delete(ownerID);
+    try {
+      const result = await clearGlobal(currentPlan, context);
+      return send({ api, message, event }, `${formatResult(result)}\n\nLes profils, paramètres non attribués aux commandes, clés inconnues, configuration et session Messenger ont été conservés.`);
+    } catch (error) {
+      console.error("[Commande nettoie] Reset global partiel ou interrompu :", error && (error.stack || error.message) || error);
+      return send({ api, message, event }, `⚠️ Le nettoyage global n’a pas pu être terminé intégralement : ${String(error.message || error).slice(0, 200)}. Vérifie le stockage avant de relancer.`);
+    }
+  }
+
+  if (!args.length || action === "tout" || action === "tous" || action === "global") {
+    try {
+      const plan = await buildGlobalPlan(context);
+      pendingConfirmations.set(ownerID, { fingerprint: getPlanFingerprint(plan), expiresAt: Date.now() + CONFIRMATION_TTL_MS });
+      return send({ api, message, event }, describeGlobalPlan(plan, prefix));
+    } catch (error) {
+      console.error("[Commande nettoie] Aperçu impossible :", error && (error.stack || error.message) || error);
+      return send({ api, message, event }, `❌ Impossible de préparer le nettoyage sans risque : ${String(error.message || error).slice(0, 200)}. Aucune donnée n’a été modifiée.`);
+    }
+  }
+
+  if (args.length > 1) return send({ api, message, event }, `❌ Utilisation : \`${prefix}nettoie <commande>\` (nettoyage ciblé) ou \`${prefix}nettoie\` (aperçu global).`);
+  const resolved = resolveScope(args[0]);
+  if (!resolved) {
+    const requested = normalizeCommandName(args[0]);
+    const known = commandExists(requested);
+    return send(
+      { api, message, event },
+      known
+        ? `ℹ️ La commande \`${args[0]}\` n’a pas de données persistantes attribuables dans la liste sûre. Rien n’a été modifié.`
+        : `❌ Commande inconnue : \`${args[0]}\`. Indique le nom d’une commande installée.`
+    );
+  }
+
+  try {
+    const result = await runTarget(resolved.name, resolved.scope, context);
+    return send({ api, message, event }, `🧹 Données de \`${resolved.name}\` réinitialisées.\n${formatResult(result)}\nLes profils et paramètres non attribués à cette commande ont été conservés.`);
+  } catch (error) {
+    console.error(`[Commande nettoie] Reset ciblé ${resolved.name} interrompu :`, error && (error.stack || error.message) || error);
+    return send({ api, message, event }, `❌ Impossible de terminer le nettoyage ciblé de \`${resolved.name}\` : ${String(error.message || error).slice(0, 200)}.`);
+  }
 }
 
 module.exports = {
   config: {
     name: "nettoie",
-    aliases: ["reset", "nettoyer", "resetbot", "wipe"],
-    version: "2.0.0",
+    version: "1.0.0",
     author: "Diwate",
-    description: "Efface la mémoire d'une commande spécifique ou de toutes (propriétaire)",
+    description: "Réinitialise uniquement les données de commandes attribuables, avec confirmation avant le reset global",
     category: "Administration",
-    usages: "nettoie <commande|tout|liste|aide> puis nettoie confirmer",
+    usages: "nettoie | nettoie confirmer | nettoie annuler | nettoie <commande>",
     role: 0
   },
-  COMMAND_KEYS,
-  PREFIX_KEYS,
-  ALL_STATIC_KEYS,
-  ALL_PREFIX_KEYS,
-  CONFIRM_TIMEOUT_MS,
-  resolveScope,
-  discoverForKeys,
-  handleNettoie,
-  onStart: async function (context) {
-    try {
-      return await handleNettoie(context);
-    } catch (error) {
-      console.error("[Commande nettoie]", error.stack || error);
-      return send({ api: context.api, message: context.message, event: context.event }, "❌ La commande nettoie a échoué. Vérifie les logs Render.");
-    }
+  onLoad: installGuard,
+  onStart,
+  _buildGlobalPlan: buildGlobalPlan,
+  _buildTargetPlan: buildTargetPlan,
+  _resolveScope: resolveScope,
+  _resetForTests() {
+    cleanupInProgress = false;
+    activeCommandHooks = 0;
+    pendingConfirmations.clear();
   }
 };
