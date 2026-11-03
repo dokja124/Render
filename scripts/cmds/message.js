@@ -2,22 +2,23 @@
 
 const { send } = require("./lib/messenger");
 
-const STORAGE_KEY = "privateMessagesV6";
-const INDEX_KEY = "privateMessagesUsersV6";
-const ACTIVITY_KEY = "privateMessagesActivityV6";
+const STORAGE_KEY = "privateMessagesV5";
+const INDEX_KEY = "privateMessagesUsersV5";
+const ACTIVITY_KEY = "privateMessagesActivityV5";
 const MAX_MESSAGE_LENGTH = 1500;
 const MAX_INBOX = 50;
 const MESSAGE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const RECIPIENTS_PER_PAGE = 20;
 const MAX_THREADS_PER_USER = 20;
-const MAX_NOTIFICATIONS = 5; // Éviter de spammer si l'utilisateur est dans 50 groupes
 
 let store = null;
 let knownUsers = null;
 let activity = null;
 let loadPromise = null;
 let mutationQueue = Promise.resolve();
+const MAX_TRACKED_EVENT_IDS = 1000;
 const RECENT_ACTIVITY_EVENT_IDS = new Map();
+const RECENT_ACTIVITY_EVENT_OBJECTS = new WeakSet();
 
 // ---------------------------------------------------------------------------
 // Utilitaires
@@ -49,6 +50,19 @@ function getPrefix(context = {}) {
   const p = config.prefix;
   if (Array.isArray(p)) return String(p[0] || "!");
   return String(p || "!");
+}
+
+function isNettoieMessage(event, context = {}) {
+  const body = String(event && (event.body || event.message) || "").trim();
+  if (!body) return false;
+  const token = body.split(/\s+/, 1)[0];
+  const config = (global.GoatBot && global.GoatBot.config) || global.config || {};
+  const configured = context.prefix || config.prefix || "!";
+  const prefixes = Array.isArray(configured) ? configured : [configured];
+  return prefixes.some(value => {
+    const prefix = String(value || "");
+    return prefix && token.startsWith(prefix) && normalize(token.slice(prefix.length)) === "nettoie";
+  });
 }
 
 function getOwnerIDs() {
@@ -95,12 +109,8 @@ function makeMessageID() {
   return `msg_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms));
-}
-
 // ---------------------------------------------------------------------------
-// Persistance
+// Persistance locale (fallback si globalData absent)
 // ---------------------------------------------------------------------------
 
 async function loadAll(globalData) {
@@ -114,9 +124,9 @@ async function loadAll(globalData) {
       await ensureGlobalDataKey(globalData, STORAGE_KEY, {});
       await ensureGlobalDataKey(globalData, INDEX_KEY, {});
       await ensureGlobalDataKey(globalData, ACTIVITY_KEY, {});
-      try { store = (await globalData.get(STORAGE_KEY, "data", {})) || {}; } catch (e) {}
-      try { knownUsers = (await globalData.get(INDEX_KEY, "data", {})) || {}; } catch (e) {}
-      try { activity = (await globalData.get(ACTIVITY_KEY, "data", {})) || {}; } catch (e) {}
+      try { store = (await globalData.get(STORAGE_KEY, "data", {})) || {}; } catch (e) { console.warn("[Message] Lecture du stockage des messages impossible :", e.message || e); }
+      try { knownUsers = (await globalData.get(INDEX_KEY, "data", {})) || {}; } catch (e) { console.warn("[Message] Lecture de l’index utilisateurs impossible :", e.message || e); }
+      try { activity = (await globalData.get(ACTIVITY_KEY, "data", {})) || {}; } catch (e) { console.warn("[Message] Lecture de l’activité impossible :", e.message || e); }
     }
     if (!store || typeof store !== "object" || Array.isArray(store)) store = {};
     if (!knownUsers || typeof knownUsers !== "object" || Array.isArray(knownUsers)) knownUsers = {};
@@ -135,7 +145,10 @@ async function ensureGlobalDataKey(globalData, key, initialData) {
   try {
     if (typeof globalData.existsSync === "function" && globalData.existsSync(key)) return;
     await globalData.create(key, { data: initialData });
-  } catch (error) {}
+  } catch (error) {
+    if (error && (error.name === "KEY_EXISTS" || error.code === "KEY_EXISTS")) return;
+    console.warn(`[Message] Création du stockage ${key} impossible :`, error && (error.message || error));
+  }
 }
 
 async function persist(globalData, which) {
@@ -144,7 +157,7 @@ async function persist(globalData, which) {
     if (which === "messages" || which === "all") await globalData.set(STORAGE_KEY, store, "data");
     if (which === "users" || which === "all") await globalData.set(INDEX_KEY, knownUsers, "data");
     if (which === "activity" || which === "all") await globalData.set(ACTIVITY_KEY, activity, "data");
-  } catch (e) {}
+  } catch (e) { console.warn("[Message] Échec de sauvegarde persistante :", e && (e.message || e)); }
 }
 
 async function mutate(globalData, fn) {
@@ -160,7 +173,7 @@ async function mutate(globalData, fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Résolution et Récupération des utilisateurs
+// Résolution du pseudo
 // ---------------------------------------------------------------------------
 
 async function resolveDisplayName(context, userID) {
@@ -192,6 +205,10 @@ async function resolveDisplayName(context, userID) {
   return `Utilisateur ${id.slice(-4)}`;
 }
 
+// ---------------------------------------------------------------------------
+// Lecture ROBUSTE de TOUS les utilisateurs de GoatBot
+// ---------------------------------------------------------------------------
+
 async function getAllUsersFromGoatBot(context) {
   const result = new Map();
   const add = (idValue, profile) => {
@@ -209,24 +226,38 @@ async function getAllUsersFromGoatBot(context) {
     }
   };
 
+  // Source canonique : la base des fiches utilisateurs du bot.
   const usersData = context.usersData || (global.GoatBot && global.GoatBot.usersData);
   if (usersData && typeof usersData.getAll === "function") {
-    try { addList(await usersData.getAll()); } catch (e) {}
+    try {
+      addList(await usersData.getAll());
+    } catch (e) {
+      console.warn("[Message] usersData.getAll a échoué :", e.message || e);
+    }
   }
 
+  // Sources de secours : elles complètent aussi une liste partielle de getAll().
   if (global.db && Array.isArray(global.db.allUserData)) addList(global.db.allUserData);
   if (global.GoatBot && Array.isArray(global.GoatBot.allUserData)) addList(global.GoatBot.allUserData);
 
   if (global.GoatBot && global.GoatBot.users instanceof Map) {
-    for (const [id, user] of global.GoatBot.users.entries()) add(id, user);
+    for (const [id, user] of global.GoatBot.users.entries()) {
+      add(id, user);
+    }
   }
 
   return Array.from(result.entries()).map(([userID, name]) => ({ userID, name }));
 }
 
+// ---------------------------------------------------------------------------
+// trackActivity
+// ---------------------------------------------------------------------------
+
 async function trackActivity(context = {}) {
   const { event, globalData } = context;
-  if (!event || !event.senderID) return;
+  if (isNettoieMessage(event, context)) return;
+  const eventType = String(event && event.type || "").toLowerCase();
+  if (eventType && eventType !== "message" && eventType !== "message_reply") return;
   const userID = getSenderID(event);
   const threadID = getThreadID(event);
   if (!userID || !threadID) return;
@@ -234,9 +265,13 @@ async function trackActivity(context = {}) {
   const rawMessageID = normalizeID(event && (event.messageID || event.messageId));
   const activityEventID = rawMessageID ? `${threadID}:${rawMessageID}` : "";
   if (activityEventID && RECENT_ACTIVITY_EVENT_IDS.has(activityEventID)) return;
+  if (!activityEventID && event && typeof event === "object") {
+    if (RECENT_ACTIVITY_EVENT_OBJECTS.has(event)) return;
+    RECENT_ACTIVITY_EVENT_OBJECTS.add(event);
+  }
   if (activityEventID) {
     RECENT_ACTIVITY_EVENT_IDS.set(activityEventID, Date.now());
-    if (RECENT_ACTIVITY_EVENT_IDS.size > 1000) {
+    while (RECENT_ACTIVITY_EVENT_IDS.size > MAX_TRACKED_EVENT_IDS) {
       RECENT_ACTIVITY_EVENT_IDS.delete(RECENT_ACTIVITY_EVENT_IDS.keys().next().value);
     }
   }
@@ -245,6 +280,12 @@ async function trackActivity(context = {}) {
   await mutate(globalData, () => {
     if (!activity[userID] || typeof activity[userID] !== "object") activity[userID] = {};
     activity[userID][threadID] = (Number(activity[userID][threadID]) || 0) + 1;
+    const threads = Object.entries(activity[userID]);
+    if (threads.length > MAX_THREADS_PER_USER) {
+      threads.sort((a, b) => Number(b[1]) - Number(a[1]))
+        .slice(MAX_THREADS_PER_USER)
+        .forEach(([tid]) => delete activity[userID][tid]);
+    }
     return { persist: "activity" };
   });
 
@@ -255,48 +296,57 @@ async function trackActivity(context = {}) {
   });
 }
 
-// ---------------------------------------------------------------------------
-// Récupération des groupes d'un utilisateur
-// ---------------------------------------------------------------------------
-
-async function getAllActiveThreads(globalData, userID) {
+async function getMostActiveThread(globalData, userID) {
   await loadAll(globalData);
   const map = activity[normalizeID(userID)];
-  if (!map || typeof map !== "object") return [];
-  
-  // On trie par nombre de messages décroissant, et on renvoie les IDs des threads
-  return Object.entries(map)
-    .sort((a, b) => (Number(b[1]) || 0) - (Number(a[1]) || 0))
-    .map(([tid]) => tid);
+  if (!map || typeof map !== "object") return null;
+  let best = null, bestCount = 0;
+  for (const [tid, count] of Object.entries(map)) {
+    const n = Number(count) || 0;
+    if (n > bestCount) { bestCount = n; best = tid; }
+  }
+  return best;
 }
 
 // ---------------------------------------------------------------------------
-// Recherche intelligente du destinataire par pseudo
+// Construction de la liste des destinataires
 // ---------------------------------------------------------------------------
 
-async function findTargetByName(context, nameToFind) {
-  const query = normalize(nameToFind);
-  if (!query) return [];
+async function buildRecipientsList(context) {
+  const { globalData, event } = context;
+  const senderID = getSenderID(event);
+  await loadAll(globalData);
 
   const goatUsers = await getAllUsersFromGoatBot(context);
+
   const merged = new Map();
-  
   for (const u of goatUsers) merged.set(u.userID, u.name);
   for (const [id, info] of Object.entries(knownUsers)) {
-    if (info && info.name && !merged.has(id)) merged.set(id, cleanName(info.name));
+    if (info && info.name && !merged.has(id)) merged.set(id, cleanName(info.name, `Utilisateur ${id.slice(-4)}`));
   }
 
-  const matches = [];
-  for (const [id, name] of merged.entries()) {
-    const safeName = normalize(name);
-    if (safeName === query) {
-        matches.push({ userID: id, name, exact: true });
-    } else if (safeName.includes(query) || query.includes(safeName)) {
-        matches.push({ userID: id, name, exact: false });
-    }
+  const list = [];
+  const seen = new Set();
+
+  for (const ownerID of getOwnerIDs()) {
+    if (ownerID === senderID || seen.has(ownerID)) continue;
+    seen.add(ownerID);
+    list.push({ userID: ownerID, name: getOwnerDisplayName(), isOwner: true });
   }
 
-  return matches.sort((a, b) => b.exact - a.exact);
+  const others = Array.from(merged.entries())
+    .filter(([id]) => id !== senderID && !seen.has(id))
+    .map(([id, name]) => ({
+      userID: id,
+      name,
+      isOwner: isOwner(id),
+      lastSeen: (knownUsers[id] && knownUsers[id].lastSeen) || 0
+    }))
+    .sort((a, b) => b.lastSeen - a.lastSeen || a.name.localeCompare(b.name, "fr"));
+
+  for (const u of others) list.push({ userID: u.userID, name: u.name, isOwner: u.isOwner });
+
+  return list;
 }
 
 function buildRecipientsText(prefix, list, requestedPage = 1) {
@@ -306,47 +356,14 @@ function buildRecipientsText(prefix, list, requestedPage = 1) {
   const start = (page - 1) * pageSize;
   const lines = list.slice(start, start + pageSize).map((r, i) => `${start + i + 1}. ${r.name}${r.isOwner ? " 👑" : ""}`);
   return [
-    `📬 **Plusieurs destinataires possibles.** Choisis avec \`${prefix}choisir <numéro>\`.`,
+    `📬 **Choisis le destinataire** en écrivant \`${prefix}choisir <numéro>\`.`,
     "",
     lines.join("\n"),
     "",
+    pageCount > 1 ? `📄 Page ${page}/${pageCount} — écris \`${prefix}message page <numéro>\` pour parcourir les autres pages.` : "",
+    `💡 Exemple : \`${prefix}choisir ${start + 1}\``,
     `🛑 Annuler : \`${prefix}message annule\``
   ].filter(Boolean).join("\n");
-}
-
-// ---------------------------------------------------------------------------
-// Envoi de la notification dans plusieurs groupes
-// ---------------------------------------------------------------------------
-
-async function sendNotificationsToUserGroups(context, targetID, targetName, senderName, prefix, fallbackThread) {
-  const { api, globalData } = context;
-  
-  let threadsToNotify = await getAllActiveThreads(globalData, targetID);
-  
-  // Si on n'a aucun groupe enregistré pour lui, on utilise le groupe courant
-  if (threadsToNotify.length === 0) {
-    threadsToNotify = [fallbackThread];
-  } else {
-    // S'assurer que le groupe courant est inclus s'il n'y est pas
-    if (!threadsToNotify.includes(fallbackThread)) {
-      threadsToNotify.push(fallbackThread);
-    }
-    // Limiter pour éviter le spam / rate limit
-    threadsToNotify = threadsToNotify.slice(0, MAX_NOTIFICATIONS);
-  }
-
-  const notificationText = `🔔 **Notification privée**\n${targetName}, tu as reçu un message privé de ${senderName}. Écris \`${prefix}voir\` dans ce groupe pour le consulter.`;
-
-  for (const threadID of threadsToNotify) {
-    try {
-      await api.sendMessage(notificationText, threadID);
-      // Petit délai pour éviter que Facebook ne considère ça comme du spam
-      await sleep(800); 
-    } catch (error) {
-      // On ignore l'erreur si le bot n'est plus dans le groupe ou n'a pas la permission
-      console.warn(`[Message] Impossible de notifier dans le groupe ${threadID}:`, error.message || error);
-    }
-  }
 }
 
 // ---------------------------------------------------------------------------
@@ -362,10 +379,24 @@ async function handleMessage(context = {}) {
 
   if (!senderID) return send({ api, message, event }, "❌ Impossible d’identifier ton compte.");
 
-  await trackActivity(context);
-
-  let rawText = args.length ? args.join(" ").trim() : body.replace(/^[^\s]+\s*/, "").trim();
+  const afterCommand = body.replace(/^[^\s]+\s*/, "").trim();
+  const rawText = args.length ? args.join(" ").trim() : afterCommand;
   const firstWord = normalize(rawText.split(/\s+/)[0] || "");
+
+  const pageMatch = rawText.match(/^page(?:\s+(\d+))?$/i);
+  if (pageMatch) {
+    await loadAll(globalData);
+    const pending = store[`pending_${senderID}`];
+    if (!pending || pending.type !== "pending" || !Array.isArray(pending.recipients)) {
+      return send({ api, message, event }, `❌ Aucun choix de destinataire en attente. Commence par \`${prefix}message <ton message>\`.`);
+    }
+    const page = pageMatch[1] ? Number(pageMatch[1]) : 1;
+    const pageCount = Math.max(1, Math.ceil(pending.recipients.length / RECIPIENTS_PER_PAGE));
+    if (!Number.isInteger(page) || page < 1 || page > pageCount) {
+      return send({ api, message, event }, `❌ Page invalide. Choisis une page entre 1 et ${pageCount}.`);
+    }
+    return send({ api, message, event }, buildRecipientsText(prefix, pending.recipients, page));
+  }
 
   if (["annule", "annuler", "cancel", "stop"].includes(firstWord)) {
     await mutate(globalData, () => {
@@ -375,14 +406,15 @@ async function handleMessage(context = {}) {
     return send({ api, message, event }, "🛑 Envoi de message annulé.");
   }
 
+  const senderName = await resolveDisplayName(context, senderID);
+
   if (!rawText) {
     return send(
       { api, message, event },
       `📨 **Commande message**\n\n` +
-      `Réponds au message de quelqu'un et écris \`${prefix}message <ton texte>\`\n` +
-      `Ou écris \`${prefix}message <ton texte> à <pseudo>\`\n` +
-      `Exemple : \`${prefix}message Salut ! à Daniel\`\n\n` +
-      `\`${prefix}voir\` pour lire tes messages`
+      `\`${prefix}message <ton message>\` puis \`${prefix}choisir <numéro>\`\n` +
+      `\`${prefix}voir\` pour lire tes messages\n` +
+      `\`${prefix}message annule\` pour annuler`
     );
   }
 
@@ -390,101 +422,28 @@ async function handleMessage(context = {}) {
     return send({ api, message, event }, `❌ Message trop long (${rawText.length}). Limite : ${MAX_MESSAGE_LENGTH}.`);
   }
 
-  let targetID = null;
-  let finalText = rawText;
-
-  const reply = event.messageReply || event.repliedMessage;
-  if (reply && reply.senderID && String(reply.senderID) !== senderID) {
-    targetID = String(reply.senderID);
+  const recipients = await buildRecipientsList(context);
+  if (recipients.length === 0) {
+    return send({ api, message, event }, "⚠️ Aucun autre utilisateur connu. Attends que d'autres personnes utilisent le bot.");
   }
-
-  if (!targetID && event.mentions && Object.keys(event.mentions).length > 0) {
-    targetID = Object.keys(event.mentions)[0];
-    const mentionName = event.mentions[targetID];
-    finalText = finalText.replace(new RegExp(`@${mentionName}`, 'gi'), '').replace(new RegExp(mentionName, 'gi'), '').trim();
-    if (!finalText) finalText = rawText;
-  }
-
-  if (!targetID) {
-    let pseudoQuery = null;
-    let extractedText = rawText;
-
-    const regexA = /\s+(?:à|a|pour)\s+(.+)$/i;
-    const matchA = rawText.match(regexA);
-    
-    if (matchA) {
-      pseudoQuery = matchA[1].trim();
-      extractedText = rawText.substring(0, matchA.index).trim();
-    } else {
-      const words = rawText.split(/\s+/);
-      if (words.length > 1) {
-        pseudoQuery = words[words.length - 1];
-        extractedText = words.slice(0, -1).join(" ");
-      }
-    }
-
-    if (pseudoQuery) {
-      const matches = await findTargetByName(context, pseudoQuery);
-      if (matches.length === 1) {
-        targetID = matches[0].userID;
-        finalText = extractedText;
-      } else if (matches.length > 1) {
-        const senderName = await resolveDisplayName(context, senderID);
-        await mutate(globalData, () => {
-          store[`pending_${senderID}`] = {
-            type: "pending",
-            from: senderID,
-            fromName: senderName,
-            threadID: getThreadID(event),
-            text: extractedText,
-            at: Date.now(),
-            recipients: matches.map(m => ({ userID: m.userID, name: m.name, isOwner: isOwner(m.userID) }))
-          };
-          return { persist: "messages" };
-        });
-        return send({ api, message, event }, `⚠️ J'ai trouvé plusieurs personnes pour "${pseudoQuery}".\n\n` + buildRecipientsText(prefix, matches));
-      } else {
-        return send({ api, message, event }, `❌ Aucun utilisateur trouvé avec le pseudo "${pseudoQuery}".\nVérifie l'orthographe ou réponds directement à son message avec \`${prefix}message <texte>\`.`);
-      }
-    }
-  }
-
-  if (!targetID) {
-    return send({ api, message, event }, `❓ Je ne sais pas à qui envoyer ce message.\nRéponds à son message avec \`${prefix}message <texte>\` ou précise \`${prefix}message <texte> à <pseudo>\`.`);
-  }
-
-  const targetName = await resolveDisplayName(context, targetID);
-  const senderName = await resolveDisplayName(context, senderID);
-  const messageID = makeMessageID();
-  const now = Date.now();
 
   await mutate(globalData, () => {
-    const box = store[targetID] && typeof store[targetID] === "object" && !store[targetID].type
-      ? store[targetID]
-      : { inbox: [] };
-    if (!Array.isArray(box.inbox)) box.inbox = [];
-    box.inbox.push({
-      id: messageID,
+    store[`pending_${senderID}`] = {
+      type: "pending",
       from: senderID,
       fromName: senderName,
-      text: finalText,
-      at: now,
-      read: false
-    });
-    if (box.inbox.length > MAX_INBOX) box.inbox = box.inbox.slice(-MAX_INBOX);
-    store[targetID] = box;
+      threadID: getThreadID(event),
+      text: rawText,
+      at: Date.now(),
+      recipients: recipients.map(r => ({ userID: r.userID, name: r.name, isOwner: r.isOwner }))
+    };
     return { persist: "messages" };
   });
 
-  await send(
+  return send(
     { api, message, event },
-    `📨 **Message envoyé à ${targetName}** ✅\n\nDès que ${targetName} écrira \`${prefix}voir\`, il/elle verra ton message.`
+    `✍️ **Message enregistré :**\n« ${rawText.slice(0, 200)}${rawText.length > 200 ? "…" : ""} »\n\n${buildRecipientsText(prefix, recipients)}`
   );
-
-  // Envoi des notifications dans les groupes du destinataire
-  await sendNotificationsToUserGroups(context, targetID, targetName, senderName, prefix, getThreadID(event));
-
-  return true;
 }
 
 async function handleNumberSelection(context, index) {
@@ -496,7 +455,7 @@ async function handleNumberSelection(context, index) {
   const pending = store[`pending_${senderID}`];
 
   if (!pending || pending.type !== "pending") {
-    return send({ api, message, event }, `❌ Aucun message en attente. Commence par \`${prefix}message <texte> à <pseudo>\`.`);
+    return send({ api, message, event }, `❌ Aucun message en attente. Commence par \`${prefix}message <ton message>\`.`);
   }
 
   const recipients = Array.isArray(pending.recipients) ? pending.recipients : [];
@@ -532,9 +491,24 @@ async function handleNumberSelection(context, index) {
     `📨 **Message envoyé à ${target.name}** ✅\n\nDès que ${target.name} écrira \`${prefix}voir\`, il/elle verra ton message.`
   );
 
-  // Envoi des notifications dans les groupes du destinataire
-  await sendNotificationsToUserGroups(context, target.userID, target.name, pending.fromName, prefix, getThreadID(event));
+  const activeThread = await getMostActiveThread(globalData, target.userID);
+  const notifyThread = activeThread || getThreadID(event);
+  const senderLabel = pending.fromName || "Quelqu’un";
 
+  try {
+    await api.sendMessage(
+      `🔔 ${target.name}, tu as reçu un message privé de ${senderLabel}. Écris \`${prefix}voir\` pour le consulter.`,
+      notifyThread
+    );
+  } catch (error) {
+    console.warn("[Message] notif :", error.message || error);
+    try {
+      await api.sendMessage(
+        `🔔 ${target.name}, tu as reçu un message privé de ${senderLabel}. Écris \`${prefix}voir\` pour le consulter.`,
+        getThreadID(event)
+      );
+    } catch (_) {}
+  }
   return true;
 }
 
@@ -580,7 +554,7 @@ async function handleVoir(context = {}) {
   return send(
     { api, message, event },
     `📬 **Tes messages (${fresh.length}) :**\n\n${lines.join("\n\n")}\n\n` +
-    `✅ Marques comme lus.\nPour répondre : \`${prefix}message <texte> à <pseudo>\``
+    `✅ Marques comme lus.\nPour répondre : \`${prefix}message <texte>\` puis \`${prefix}choisir <numéro>\`.`
   );
 }
 
@@ -594,41 +568,62 @@ async function handleCommand(context = {}) {
   const body = String(context.event && context.event.body || "").trim();
   const firstToken = body.split(/\s+/)[0] || "";
   const invokedFromBody = normalize(firstToken.replace(/^[^A-Za-z0-9]+/, ""));
+
   const invoked = commandName || invokedFromBody;
 
-  if (["choisir", "select"].includes(invoked)) {
-    const num = parseInt(args[0], 10);
-    if (isNaN(num)) {
+  // Cas "!choisir 2" / "!select 2" / "!destinataire 2"
+  if (["choisir", "select", "destinataire"].includes(invoked) || ["choisir", "select", "destinataire"].includes(invokedFromBody)) {
+    const rawSelection = String(args[0] || "").trim();
+    const num = /^\d+$/.test(rawSelection) ? Number(rawSelection) : NaN;
+    if (!Number.isInteger(num)) {
       return send(context, "❌ Utilisation : `!choisir <numéro>` — exemple : `!choisir 2`.");
     }
     return handleNumberSelection(context, num);
   }
 
-  if (["voir", "messages", "inbox"].includes(invoked)) {
+  // Cas "!voir"
+  if (invoked === "voir" || invoked === "messages" || invoked === "inbox" || ["voir", "messages", "inbox"].includes(invokedFromBody)) {
     return handleVoir(context);
   }
 
+  // Sinon : !message
   return handleMessage(context);
 }
 
 module.exports = {
   config: {
     name: "message",
-    aliases: ["msg", "dm", "voir", "messages", "inbox", "choisir", "select"],
-    version: "6.2.0",
+    aliases: ["msg", "dm", "voir", "messages", "inbox", "choisir", "select", "destinataire"],
+    version: "6.0.0",
     author: "Diwate",
-    description: "Envoie un message privé (syntaxe : !message <texte> à <pseudo>)",
+    description: "Enregistre les utilisateurs actifs et permet de leur envoyer un message privé via une liste paginée",
     category: "Social",
-    usages: "message <texte> à <pseudo> | choisir <numéro> | message annule | voir",
+    usages: "message <texte> | message page <numéro> | choisir <numéro> | message annule | voir",
     role: 0
   },
-  trackActivity,
-  getAllUsersFromGoatBot,
-  handleMessage,
-  handleNumberSelection,
-  handleVoir,
+  STORAGE_KEY, INDEX_KEY, ACTIVITY_KEY, MAX_MESSAGE_LENGTH,
+  trackActivity, getMostActiveThread, getAllUsersFromGoatBot,
+  handleMessage, handleNumberSelection, handleVoir,
+  buildRecipientsList, buildRecipientsText, resolveDisplayName, cleanName, extractProfileName,
+  async _clearMemory() {
+    await mutationQueue.catch(() => {});
+    store = {};
+    knownUsers = {};
+    activity = {};
+    loadPromise = null;
+    mutationQueue = Promise.resolve();
+    RECENT_ACTIVITY_EVENT_IDS.clear();
+    return true;
+  },
+  onChat: function (context) {
+    return async function () {
+      try { await trackActivity(context); }
+      catch (error) { console.warn("[Message] Suivi de l’activité impossible :", error && (error.message || error)); }
+    };
+  },
   onStart: async function (context) {
     try {
+      await trackActivity(context);
       return await handleCommand(context);
     } catch (error) {
       console.error("[Commande message]", error.stack || error);
