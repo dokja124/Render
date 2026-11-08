@@ -1,1 +1,114 @@
-
+{
+  "generatedAt": "2026-11-08T12:50:04.009Z",
+  "assets": [
+    {
+      "key": "animal",
+      "query": "fantasy animal companion wolf fox owl game art",
+      "file": "scripts/cmds/assets/openworld/animal.jpg",
+      "source": "Pinterest",
+      "title": "fantasy animal companion wolf fox owl game art",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShxO7jCOdC-TrH6jIF0IpxWlJwCPN0q_HZFK6ZV7C_vdfjNm/",
+      "bytes": 173999
+    },
+    {
+      "key": "camp",
+      "query": "fantasy adventurer campfire campsite game environment art",
+      "file": "scripts/cmds/assets/openworld/camp.jpg",
+      "source": "Pinterest",
+      "title": "fantasy adventurer campfire campsite game environment art",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShxtZV_dH1GVYjEYV-tQQ947amBMTe2rhGUiiDFXo7buxYN1/",
+      "bytes": 452340
+    },
+    {
+      "key": "coast",
+      "query": "fantasy rocky coast sea cliffs environment game concept art",
+      "file": "scripts/cmds/assets/openworld/coast.jpg",
+      "source": "Pinterest",
+      "title": "fantasy rocky coast sea cliffs environment game concept art",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShzaPlj_Dy-SaAomXtAY3wzHc0K-xh_uAgowcVu59E6EG59D/",
+      "bytes": 312271
+    },
+    {
+      "key": "combat",
+      "query": "fantasy RPG warrior fighting monster dramatic battle scene",
+      "file": "scripts/cmds/assets/openworld/combat.jpg",
+      "source": "Pinterest",
+      "title": "Epic Fantasy Battle — Knight vs Dark Beast at Sunset Castle",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShy92ERxqLCMT0a06w2Smdd2v138y77cisuHHzYrmjnIBcnA5w/",
+      "bytes": 397798
+    },
+    {
+      "key": "desert",
+      "query": "fantasy desert dunes canyon game environment landscape art",
+      "file": "scripts/cmds/assets/openworld/desert.jpg",
+      "source": "Pinterest",
+      "title": "ArtStation - Desert, J Line",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShz_GWio3CDJgB3QepN0amZ49aLqrgGRvZBZWkCo0TSOcXXI/",
+      "bytes": 179459
+    },
+    {
+      "key": "forest",
+      "query": "fantasy forest landscape game environment concept art",
+      "file": "scripts/cmds/assets/openworld/forest.jpg",
+      "source": "Pinterest",
+      "title": "fantasy forest landscape game environment concept art",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShyyxNk2ZIsGOdV-kwLg94LuCNKL-yiI-zgNFfuFLuENcmrT/",
+      "bytes": 263840
+    },
+    {
+      "key": "hazard",
+      "query": "fantasy storm lightning dangerous landscape game environment",
+      "file": "scripts/cmds/assets/openworld/hazard.jpg",
+      "source": "Pinterest",
+      "title": "fantasy storm lightning dangerous landscape game environment",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShxBLoLXlCL7jqAlHy_UeGm67LpZj-R-Rttx7SwT6VbMs2L8/",
+      "bytes": 2145830
+    },
+    {
+      "key": "mountains",
+      "query": "fantasy mountain snowy peaks open world environment landscape",
+      "file": "scripts/cmds/assets/openworld/mountains.jpg",
+      "source": "Pinterest",
+      "title": "fantasy mountain snowy peaks open world environment landscape",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShzNikKR96RbV887zFwFzplrYx1qQzNRFbJnnk1rnfwyB1Bt/",
+      "bytes": 120843
+    },
+    {
+      "key": "quest",
+      "query": "fantasy quest map parchment compass game illustration",
+      "file": "scripts/cmds/assets/openworld/quest.jpg",
+      "source": "Pinterest",
+      "title": "fantasy quest map parchment compass game illustration",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShzTi5U8OzmlFK1I76B0UgvR6mGFgs3LFlFdZXuMjZwoCJpl/",
+      "bytes": 263080
+    },
+    {
+      "key": "resource",
+      "query": "fantasy herb gathering forest magical plants RPG environment art",
+      "file": "scripts/cmds/assets/openworld/resource.jpg",
+      "source": "Pinterest",
+      "title": "fantasy herb gathering forest magical plants RPG environment art",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShygsIbtUHFO7SaqDaEzdB1OVHBlJpC-q1W7X6bRA4LhMJiM/",
+      "bytes": 409989
+    },
+    {
+      "key": "ruins",
+      "query": "ancient fantasy ruins temple open world environment landscape",
+      "file": "scripts/cmds/assets/openworld/ruins.jpg",
+      "source": "Pinterest",
+      "title": "Ruined colosseum",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShxWESxD9ZJP021q9Uz04KgmqUaOy8ykj5qZYzkf2qqJvne7/",
+      "bytes": 857649
+    },
+    {
+      "key": "treasure",
+      "query": "fantasy dungeon treasure room illustration game art",
+      "file": "scripts/cmds/assets/openworld/treasure.jpg",
+      "source": "Pinterest",
+      "title": "fantasy dungeon treasure room illustration game art",
+      "pinterestPage": "https://www.pinterest.com/pin/e1_AfqPShyxjszoHuihBLnz0wGJYpPnTRuEBVpl8hcphX4Vf2AaV-Po/",
+      "bytes": 295332
+    }
+  ],
+  "failed": []
+}
